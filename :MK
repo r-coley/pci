@@ -1,0 +1,29 @@
+if [ $# -eq 1 ] 
+then 
+	install=1
+else
+	install=0
+fi
+
+set -x
+cc -I. -DUSL -DAT386 -DVPIX -DWEITEK -DMERGE386 -D_KERNEL -c pci.c
+cc -I. -DUSL -DAT386 -DVPIX -DWEITEK -DMERGE386 -D_KERNEL -c pci_name.c
+cc -I. -DUSL -DAT386 -DVPIX -DWEITEK -DMERGE386 -D_KERNEL -c pci_bios.c
+cc -I. -DUSL -DAT386 -DVPIX -DWEITEK -DMERGE386 -D_KERNEL -c pci_pir.c
+ld -r -o Driver.o pci.o pci_name.o pci_bios.o pci_pir.o
+mkdir -p /etc/conf/pack.d/pci 2>/dev/null
+cp Driver.o /etc/conf/pack.d/pci/
+cp ID/Space.c /etc/conf/pack.d/pci/space.c
+
+if [ $install -eq 1 ]
+then
+	echo "Install"
+	cp ID/System /etc/conf/sdevice.d/pci
+	cp ID/Master /etc/conf/mdevice.d/pci
+	grep "^pci" /etc/conf/cf.d/mdevice >/dev/null 2>&1
+	if [ $? -eq 1 ]
+	then
+		echo Adding to mdevice
+		cat ID/Master >> /etc/conf/cf.d/mdevice
+	fi
+fi
