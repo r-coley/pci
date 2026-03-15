@@ -1,7 +1,5 @@
 /*
  * pci_bios.h
- *
- * PCI defines and function prototypes
  */
 #ifndef PCI_BIOS_H
 #define PCI_BIOS_H
@@ -61,42 +59,6 @@ struct smbios_structure_header {
 #define PIR_LEN		4
 #define PIR_STEP	0x10
 #define PIR_OFF		0x0
-
-#pragma pack(1)
-typedef struct PIR_header {
-	u8_t	ph_signature[4];
-	u16_t	ph_version;	
-	u16_t	ph_length;	
-	u8_t	ph_router_bus;
-	u8_t	ph_router_dev_fn;
-	u16_t	ph_pci_irqs;
-	u16_t	ph_router_vendor;
-	u16_t	ph_router_device;
-	u32_t	ph_miniport;
-	u8_t	ph_res[11];
-	u8_t	ph_checksum;
-} PIR_header_t;
-
-#pragma pack(1)
-typedef struct PIR_intpin {
-	u8_t	link;
-	u16_t	irqs;
-} PIR_intpin_t;
-
-#pragma pack(1)
-typedef struct PIR_entry {
-	u8_t	pe_bus;
-	u8_t	pe_devfn;
-	struct	PIR_intpin	pe_intpin[4];
-	u8_t	pe_slot;
-	u8_t	pe_res3;
-} PIR_entry_t;
-
-#pragma pack(1)
-typedef struct PIR_table {
-	PIR_header_t pt_header;
-	PIR_entry_t  pt_entry[1];
-} PIR_table_t;
 
 #define BIOS32_START	0x0
 #define BIOS32_SIG	"_32_"

@@ -5,30 +5,7 @@
 #include <sys/types.h>
 
 #include "pci.h"
-
-#define MAX_DEV_PER_VENDOR	16
-
-typedef struct {
-	u16_t	device_id;
-	char	*devicename;
-} pci_dev_t;
-
-typedef struct {
-	u8_t	subclass_id;
-	char	*subclass_name;
-} pci_subclass_t;
-
-typedef struct {
-	u8_t		class_id;
-	char		*class_name;
-	pci_subclass_t	subclass_list[16];
-} pci_class_t;
-
-typedef struct {
-	u16_t		vendor_id;
-	char		*vendorname;
-	pci_dev_t	device[MAX_DEV_PER_VENDOR];
-} pci_vendor_device_t;
+#include "pci_funcs.h"
 
 static pci_class_t class_list[] =
 {

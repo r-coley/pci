@@ -6,6 +6,8 @@
 #include <sys/immu.h>
 
 #include "pci.h"
+#include "pci_bios.h"
+#include "pci_funcs.h"
 
 int	verbose_bios = 0;
 
@@ -30,11 +32,13 @@ U64(u32_t low, u32_t high)
 char *
 Str(char *ptr, int n)
 {
-	static char buf[20];
+	static char buf[32];
 	int i;
 
-	for (i = 0; i < n; i++)
-		buf[i] = *ptr++;
+	if (n >= sizeof(buf))
+		n=sizeof(buf)-1;
+
+	memcpy(buf,ptr,n);
 	buf[i] = 0;
 	return buf;
 }
@@ -66,16 +70,13 @@ pir_bios(void *addr)
 	PIR_header_t	*phdr = &ptbl->pt_header;
 	PIR_entry_t	*pent;
 
+	DrvDebug(_PCI,5,"pir_bios()\n");
+
 	if (!checksum(addr, phdr->ph_length)) return;
 
 	/*
-	 * Record the router bus/devfn unconditionally — these globals are
+	 * Record the router bus/devfn unconditionally these globals are
 	 * needed by all PIRQ routing functions regardless of verbosity.
-	 *
-	 * Bug fixed: were inside the verbose_bios block, so whenever
-	 * verbose_bios == 0 (the normal production case) Pbn and Pdevfn
-	 * remained zero and every routing function silently operated on
-	 * bus 0 device 0 instead of the actual interrupt router.
 	 */
 	Pbn    = phdr->ph_router_bus;
 	Pdevfn = phdr->ph_router_dev_fn;
@@ -132,11 +133,12 @@ sm_bios(void *addr)
 	if (length != 0x1f) {
 		if (length == 0x1e && major == 2 && minor == 1)
 			length = 0x1f;
-		else
+		else {
+			DrvDebug(_PCI,5,"sm_bios() Not Found\n");
 			return;
+		}
 	}
-	if (verbose_bios)
-		printf("System Management Bios %d.%d\n", major, minor);
+	DrvDebug(_PCI,5,"System Management Bios %d.%d\n", major, minor);
 }
 
 void
@@ -146,10 +148,14 @@ bios32(void *addr)
 	size_t	 len;
 	u32_t	 iaddr;
 
+
 	p    = (u8_t *)addr;
 	len  = p[0x09] << 4;
 
-	if (len < 0x0a || !checksum(p, len)) return;
+	if (len < 0x0a || !checksum(p, len)) {
+		DrvDebug(_PCI,5,"bios32() Not Found\n");
+		return;
+	}
 
 	rev   = p[0x08];
 	iaddr = DWORD(p + 0x04);
@@ -179,10 +185,14 @@ pnp_bios(void *addr)
 	u8_t	*p;
 	size_t	 len;
 
+
 	p   = (u8_t *)addr;
 	len = p[0x05] << 4;
 
-	if (len < 0x20 || !checksum(p, len)) return;
+	if (len < 0x20 || !checksum(p, len)) {
+		DrvDebug(_PCI,5,"pnp_bios() Not Found\n");
+		return;
+	}
 
 	if (verbose_bios) {
 		printf("PNP BIOS %d.%d present\n", p[0x04] >> 4, p[0x04] & 0xf);
@@ -232,7 +242,10 @@ dmi_bios(void *addr)
 	p   = (u8_t *)addr;
 	len = p[0x05];
 
-	if (len < 0x0f || !checksum(p, len)) return;
+	if (len < 0x0f || !checksum(p, len)) {
+		DrvDebug(_PCI,5,"dmi_bios() Not Found\n");
+		return;
+	}
 
 	if (verbose_bios) {
 		printf("Legacy DMI %d.%d present.\n",
@@ -278,6 +291,8 @@ acpi_bios(void *addr)
 {
 	RSDP_t	*rsdp = addr;
 	RSDT_t	*rsdt = 0;
+
+	DrvDebug(_PCI,5,"acpi_bios()\n");
 
 	if (!checksum((u8_t *)rsdp, (rsdp->Revision < 2) ? sizeof(RSDP_t)
 	                                         : sizeof(XSDP_t))) {
@@ -374,6 +389,8 @@ scan_bios()
 	u32_t		    addr;
 	int		    siglen;
 	struct bios_entry  *ptr;
+
+	DrvDebug(_PCI,5,"scan_bios()\n");
 
 	for (ptr = &bios_entries[0]; ptr->sig; ptr++) {
 		siglen = strlen(ptr->sig);

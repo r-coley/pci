@@ -9,6 +9,8 @@
 #include <sys/kmem.h>
 
 #include "pci.h"
+#include "pci_bios.h"
+#include "pci_funcs.h"
 
 #define NUM_ISA_INTERRUPTS	16
 
@@ -28,8 +30,10 @@ pci_pir_dump_links(PIR_table_t *pt)
 {
 	List_t *p;
 	pci_link_t *pci_link;
+	char	*device_name;
 
 	printf("PCI Route Table\n");
+
 	printf("Router: %02d:%02d.%1d [%4x][%4x]\n",
 		pt->pt_header.ph_router_bus,
 		PCI_SLOT(pt->pt_header.ph_router_dev_fn),
@@ -37,16 +41,20 @@ pci_pir_dump_links(PIR_table_t *pt)
 		pt->pt_header.ph_router_vendor,
 		pt->pt_header.ph_router_device);
 
-	printf("Link  IRQ  Routed   Ref             IRQs\n");
+	device_name = get_pci_dev(pt->pt_header.ph_router_vendor,
+		pt->pt_header.ph_router_device);
+	if (device_name != 0)
+		printf("PCI: IRQ router: %s\n", device_name);
+
+	printf("Link  IRQ  Routed           Allowed IRQs\n");
 	list_for_each(p, &pci_links) 
 	{
 		pci_link=list_entry(p,pci_link_t,list);
 
-		printf("%4x  %3d       %c   %3d  ", 
+		printf("%4x  %3d       %c     ", 
 			pci_link->pl_id,
 			pci_link->pl_irq, 
-			pci_link->pl_routed ? 'Y' : 'N',
-			pci_link->pl_references);
+			pci_link->pl_routed ? 'Y' : 'N');
 		pci_print_irqmask(pci_link->pl_irqmask);
 		printf("\n");
 	}
@@ -71,66 +79,39 @@ void
 pci_pir_parse(u32_t addr)
 {
 	PIR_table_t *pt;
-	pci_link_t *pci_link;
-	List_t	*p;
+	int	nroutes;
 
-	if (pci_route_table != NULL) return;
+	DrvDebug(_PCI,5,"pci_pir_parse()\n");
+
+	if (addr == 0)
+		return;
 
 	pt = (PIR_table_t *)(u8_t *)(addr);
-	if (pt->pt_header.ph_length <= sizeof(PIR_header_t)) return;
-	if (!checksum((u8_t *)pt,pt->pt_header.ph_length)) return;
+	if (pt == NULL)
+		return;
+
+	if (pt->pt_header.ph_length <= sizeof(PIR_header_t)) 
+		return;
+
+	if (bcmp(pt->pt_header.ph_signature,"$PIR",4) != 0)
+		return;
+
+	if (!checksum((u8_t *)pt,pt->pt_header.ph_length)) 
+		return;
+
+	nroutes = (pt->pt_header.ph_length - 
+				sizeof(PIR_header_t)) / sizeof(PIR_entry_t);
+	if (nroutes <= 0)
+		return;
 
 	pci_route_table = pt;
-	pci_route_count = (pt->pt_header.ph_length - 
-				sizeof(PIR_header_t)) / sizeof(PIR_entry_t);
+	pci_route_count = nroutes;
 
-	if (pir_parsed) return;
-	pir_parsed = 1;
-
-	/*** Enumerate link devices ***/
 	pci_pir_walk_table(pci_pir_create_links,NULL);
-#if 0
-	printf("$PIR: Links after initial probe\n");
-	pci_pir_dump_links(pt); 
-#endif
+	printf("PCI: PIR table at %x, %d entries\n",addr,pci_route_count);
 
-	/*
-	 * Check to see if the BIOS has already routed any of the links by 
-	 * checking each device connected to each link to see if it has a 
-	 * valid IRQ
-	 */
-	pci_pir_walk_table(pci_pir_initial_irqs,NULL);
-#if 0
-	printf("$PIR: Links after initial IRQ discovery\n");
-	pci_pir_dump_links(pt);
-#endif
-
-	/* 
-	 * Build initial interrupt weights as well as bitmap of "known-good"
-	 * IRQs that the BIOS has already used for PCI link devices
-	 */
-	list_for_each(p, &pci_links) {
-		pci_link=list_entry(p,pci_link_t,list);
-
-		if (!PCI_INTERRUPT_VALID(pci_link->pl_irq)) continue;
-
-		pir_bios_irqs |= 1 << pci_link->pl_irq;
-		pir_interrupt_weight[pci_link->pl_irq] += 
-			pci_link->pl_references;
-	}
-
-#if 0
-	printf("$PIR: IRQs used by BIOS: ");
-	pci_print_irqmask(pir_bios_irqs);
-	printf("\n");
-	printf("$PIR: Interrupt Weights:\n[ ");
-	for(i=0; i<NUM_ISA_INTERRUPTS; i++)
-		printf("%2d ",i);
-	printf("]\n[ ");
-	for(i=0; i<NUM_ISA_INTERRUPTS; i++)
-		printf("%2d ", pir_interrupt_weight[i]);
-	printf("]\n");
-#endif
+	if (pci_debug>0)
+		pci_pir_dump_links(pt);
 }
 
 void
@@ -139,6 +120,8 @@ pci_pir_walk_table(pir_entry_handler *handler, void *arg)
 	PIR_entry_t *entry;
 	PIR_intpin_t *intpin;
 	int	i, pin;
+
+	DrvDebug(_PCI,5,"pci_pir_walk_table()\n");
 
 	for(i=0; i < pci_route_count; i++) 
 	{
@@ -159,7 +142,13 @@ pci_pir_create_links(PIR_entry_t *entry, PIR_intpin_t *intpin, void *arg)
 {
 	pci_link_t *pci_link;
 
-	if (!(pci_link = pci_pir_find_link(intpin->link))) {
+	DrvDebug(_PCI,9,"pci_pir_create_links()\n");
+
+	pci_link = pci_pir_find_link(intpin->link);
+	if (!pci_link) {
+		DrvDebug(_PCI,5,"pci_pir_create_links: new link 0x%02x mask 0x%04x\n", 
+			intpin->link, intpin->irqs);
+
 		pci_link=kmem_zalloc(sizeof(pci_link_t), KM_NOSLEEP);
 		if (pci_link == NULL) {
 			printf("$PIR: out of memory for link 0x%02x\n",intpin->link);
@@ -206,7 +195,7 @@ pci_pir_find_link_handler(PIR_entry_t *ent, PIR_intpin_t *intpin, void *arg)
 	lkup = (pci_link_lookup_t *)arg;
 
 	if (ent->pe_bus == lkup->bn &&
-	    PCI_SLOT(ent->pe_devfn) == PCI_SLOT(lkup->devfn) &&
+	    ent->pe_devfn == lkup->devfn &&
 	    pin == lkup->pin) {
 		*lkup->pci_link_ptr = pci_pir_find_link(intpin->link);
 	}
@@ -215,7 +204,12 @@ pci_pir_find_link_handler(PIR_entry_t *ent, PIR_intpin_t *intpin, void *arg)
 int
 pci_pir_valid_irq(pci_link_t *pci_link, int irq)
 {
-	if (!PCI_INTERRUPT_VALID(irq)) return 0;
+	if (pci_link == NULL) 
+		return 0;
+
+	if (!PCI_INTERRUPT_VALID(irq)) 
+		return 0;
+
 	return (pci_link->pl_irqmask & (1 << irq));
 }
 
@@ -225,16 +219,16 @@ pci_pir_search_irq(u8_t bn, u8_t devfn, int pin)
 	u8_t	intpin, intline;
 	u16_t	vid;
 
-	prcw(bn,devfn,PCI_VENDOR_ID,&vid);
-	if (vid == PCIV_INVALID) return PCI_INVALID_IRQ;
+	if ((prcw(bn,devfn,PCI_VENDOR_ID,&vid) != 0) || 
+	    (vid == PCIV_INVALID)) return PCI_INVALID_IRQ;
 
-	prcb(bn,devfn,PCI_INTERRUPT_PIN,&intpin);
-	if (intpin != pin + 1) return PCI_INVALID_IRQ;
-		
-	prcb(bn,devfn,PCI_INTERRUPT_LINE,&intline);
-	if (intline != PCI_INVALID_IRQ) return intline;
+	if ((prcb(bn,devfn,PCI_INTERRUPT_PIN,&intpin) != 0) || 
+	    (intpin != pin+1)) return PCI_INVALID_IRQ;
 
-	return PCI_INVALID_IRQ;
+	if ((prcb(bn,devfn,PCI_INTERRUPT_LINE,&intline) != 0) || 
+	    (intline == PCI_INVALID_IRQ)) return PCI_INVALID_IRQ;
+
+	return intline;
 }
 
 void
@@ -312,13 +306,22 @@ pci_pir_choose_irq(pci_link_t *pci_link, int irqmask)
 }
 
 pci_link_t *
-pci_pir_route_interrupt(pcidev_t *pdev,int (*func)())
+pci_pir_route_interrupt(pcidev_t *pdev)
 {
 	pci_link_lookup_t lookup;
 	pci_link_t *pci_link=NULL;
-	int	error, irq;
+	int	irq, error;
 
-	if (pci_route_table == NULL) return (pci_link_t *)PCI_INVALID_IRQ;
+	DrvDebug(_PCI,5,"pci_pir_route_interrupt()\n");
+
+	if (pdev == NULL)
+		return NULL;
+	
+	if (pdev->intpin < 1 || pdev->intpin > 4)
+		return NULL;
+
+	if (pci_route_table == NULL) 
+		return NULL;
 
 	lookup.bn = pdev->bn;
 	lookup.devfn = pdev->devfn;
@@ -332,7 +335,7 @@ pci_pir_route_interrupt(pcidev_t *pdev,int (*func)())
 			PCI_SLOT(pdev->devfn),	
 			PCI_FUNC(pdev->devfn),
 			IntPin(pdev->intpin));
-		return (pci_link_t *)PCI_INVALID_IRQ;
+		return NULL;
 	}
 
 	if (!PCI_INTERRUPT_VALID(pci_link->pl_irq)) {
@@ -349,26 +352,29 @@ pci_pir_route_interrupt(pcidev_t *pdev,int (*func)())
 			irq=pci_pir_choose_irq(pci_link,pir_irq_override_mask);
 
 		if (!PCI_INTERRUPT_VALID(irq))
-			return (pci_link_t *)PCI_INVALID_IRQ;	
+			return NULL;
 
 		pci_link->pl_irq=irq;
 	}
 
 	if (!pci_link->pl_routed) {
-		error=pci_pir_biosroute(pdev->bn,
-					pdev->devfn,
-					pdev->intpin-1,
-					pci_link->pl_irq);
+		error = pci_pir_biosroute(pdev->bn,
+					  pdev->devfn,
+					  lookup.pin, 
+					  irq);
+		if (error != 0)
+			return NULL;
 		
-		if (error && !powerof2(pci_link->pl_irqmask)) {
-			printf("$PIR: ROUTE_INTERRUPT failed\n");
-			return (pci_link_t *)PCI_INVALID_IRQ;
-		}
-		pci_link->pl_routed=1;
-		BUS_CONFIG_INTR(pir_device,pci_link->pl_irq,
-				INTR_TRIGGER_LEVEL, INTR_POLARITY_LOW);
+		error = BUS_CONFIG_INTR(pir_device,
+			    		irq,
+			    		INTR_TRIGGER_LEVEL, 
+			    		INTR_POLARITY_LOW);
+		if (error != 0)
+			return NULL;
+
+		pci_link->pl_routed = 1;
 	}
-#if 0
+#if 0 
 	printf("$PIR: %02d:%02d.%d INT#%c routed to irq %d\n",
 		pdev->bn,
 		PCI_SLOT(pdev->devfn),
@@ -388,6 +394,8 @@ BUS_CONFIG_INTR(pcidev_t *pcidev,int irq,enum intr_trigger trig,enum intr_polari
 	u32_t	vector;
 	extern int elcr_found;
 	extern	int	level_intr_mask;	/*KERNEL*/
+
+	DrvDebug(_PCI,5,"BUS_CONFIG_INTR()\n");
 
 	if (trig == INTR_TRIGGER_CONFORM)
 		trig = INTR_TRIGGER_EDGE;
@@ -422,9 +430,9 @@ BUS_CONFIG_INTR(pcidev_t *pcidev,int irq,enum intr_trigger trig,enum intr_polari
 int
 pci_pir_biosroute(u8_t bus,u8_t devfn,int pin,int irq)
 {
-	extern	int (*PirRoute)(int,int,...);
+	DrvDebug(_PCI,5,"pci_pir_biosroute()\n");
 
-	if (!PirRoute) {
+	if (!pci_router || !pci_router->route) {
 		printf("$PIR: biosroute: no router installed\n");
 		return ENXIO;
 	}
@@ -433,5 +441,5 @@ pci_pir_biosroute(u8_t bus,u8_t devfn,int pin,int irq)
 		printf("$PIR: biosroute: router location unknown\n");
 		return ENXIO;
 	}
-	return PirRoute(PIRQ_SET, pin+1, irq);
+	return pci_router->route(PIRQ_SET, pin+1, irq);
 }

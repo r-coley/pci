@@ -1,8 +1,5 @@
 /*
  * pci.c
- * 
- * Scan the PCI tables that the ROM has setup to build a table of
- * PCI devices
  */
 #include <sys/types.h>
 #include <sys/seg.h>
@@ -16,6 +13,8 @@
 #include <stdarg.h>
 
 #include "pci.h"
+#include "pci_ids.h"
+#include "pci_funcs.h"
 
 #define ELCR_PORT	0x4d0
 #define ELCR_MASK(irq)	(1 << (irq))
@@ -27,7 +26,14 @@ int	elcr_status;
 int	elcr_found=0;
 u8_t	pci_remaps[4] = { 0 };
 u8_t 	Pbn, Pdevfn;
-int	(*PirRoute)(int,int,...);
+pci_router_ops_t	*pci_router = 0;
+
+static pci_router_ops_t pci_generic_router_ops =
+{
+	"PCI",
+	PCI_route,
+	0x60
+};
 
 i440fx_t	i440;
 piix3_t		piix3;
@@ -50,14 +56,6 @@ extern  unsigned char curmask[];        /* current masks for pics */
 extern  int     npic;                   /* number of pics configured */
 extern 	int picmax;               /* index of last pic */
 
-#if 0
-extern int eisa_bus;
-/* defined in modules/pic/space.c: */
-extern  unsigned short cmdport[];       /* command port addrs for pics */
-extern  unsigned char masterpic[];      /* index of this pic's master */
-extern  unsigned char picbuffered;      /* true if pic buffered */
-#endif
-
 /*
  * iplmask[] contains the pic masks for each interrupt priority level.
  * It is effectively dimensioned iplmask[IPLHI][NPIC],
@@ -72,6 +70,7 @@ extern	int	splvalid_flag;
 extern int ipl;                  /* current interrupt priority level */
 extern int picipl;               /* interrupt priority level of pic masks */
 
+int	PCI_route(int,int,...);
 
 /*
  * Main SVR4 Driver Entry points
@@ -81,8 +80,14 @@ pciinit()
 {
 	uint_t	tmp;
 	int	x;
+	extern int verbose_bios;
+
+	DrvDebug(_PCI,5,"pciinit()\n");
+	if (pci_debug>0)
+		verbose_bios=1;
 
 	if (pci_devices != 0) return;
+
 	outl(CFG_ADDR,0);
 	tmp=inl(CFG_ADDR);
 	if (tmp != 0x00000000)
@@ -91,7 +96,7 @@ pciinit()
 		return;
 	}
 
-	PirRoute=&PCI_route;
+		pci_router=&pci_generic_router_ops;
 	scan_bios();
 
 	bzero(&pci_root, sizeof(pci_root));
@@ -119,18 +124,24 @@ pciinit()
 int
 pciopen()
 {
+	DrvDebug(_PCI,5,"pciopen()\n");
+	
 	return 0;
 }
 
 int
 pciclose()
 {
+	DrvDebug(_PCI,5,"pciclose()\n");
+
 	return 0;
 }
 
 int
 pciread()
 {
+	DrvDebug(_PCI,5,"pciread()\n");
+
 	return 0;
 }
 		
@@ -193,7 +204,8 @@ pci(int mode,u8_t bus,u8_t devfn,u8_t reg,u32_t value,int sz)
 int
 ffs(int mask)
 {
-	int bit;
+	int 	bit;
+
 	if (mask==0) return 0;
 	for(bit=1;!(mask&1); bit++)
 		mask=(uint_t)mask>>1;
@@ -216,19 +228,17 @@ IntPin(u8_t pin)
 
 
 u32_t
-barsize(u32_t x)
+barsize(u32_t mask)
 {
-	u32_t i,v;
-
-	x &= MEMMASK;
-	if (x==0) return 0;
-	v=(x & ~(x-1));
-	return v;
+	if (mask == 0) 
+		return 0;
+	return mask & (~mask + 1);
 }
 
 void
 burst_bridge(u8_t bus, u8_t devfn, u8_t pos, int turn_on)
 {
+	DrvDebug(_PCI,5,"burst_bridge()\n");
 }
 
 void *
@@ -258,6 +268,89 @@ get_map_base(u32_t addr)
 		return addr & ~0x0f;
 }
 
+static void
+pci_print_one_device(pcidev_t *dev)
+{
+	int	i;
+	u8_t	base, sub, prog;
+	char	*vendor_name;
+	char	*device_name;
+	char	*class_name;
+	char	*subclass_name;
+
+	DrvDebug(_PCI,5,"pci_print_one_device()\n");
+
+	base = (u8_t)((dev->class >> 16) & 0xff);
+	sub  = (u8_t)((dev->class >> 8) & 0xff);
+	prog = (u8_t)(dev->class & 0xff);
+
+	vendor_name = get_pci_vendor_name(dev->vendor);
+	device_name = get_pci_dev(dev->vendor, dev->device);
+	class_name = get_pci_class_name(base);
+	subclass_name = get_pci_subclass_name(base, sub);
+
+	printf("PCI: %02x:%02x.%x ",
+		dev->bn,
+		PCI_SLOT(dev->devfn),
+		PCI_FUNC(dev->devfn));
+
+	if (device_name != 0)
+		printf("%s", device_name);
+	else if (subclass_name != 0)
+		printf("%s", subclass_name);
+	else if (class_name != 0)
+		printf("%s", class_name);
+	else
+		printf("Unknown PCI Device");
+
+	printf(" [%04x:%04x]", dev->vendor, dev->device);
+	if (vendor_name != 0)
+		printf(" (%s)", vendor_name);
+	printf(" class=%02x/%02x/%02x", base, sub, prog);
+	if (dev->intpin != 0 || dev->irq != PCI_INVALID_IRQ)
+		printf(" IRQ:%d INT#%c", dev->irq, IntPin(dev->intpin));
+	printf("\n");
+
+	for (i = 0; i < DEVICE_COUNT_RESOURCE; i++) {
+		if (dev->resource[i].flags == 0)
+			continue;
+
+		printf("  BAR%d ", i);
+		if (dev->resource[i].flags & IORESOURCE_IO)
+			printf("IO  %08lx-%08lx",
+				(unsigned long)dev->resource[i].start,
+				(unsigned long)dev->resource[i].end);
+		else if (dev->resource[i].flags & IORESOURCE_MEM)
+			printf("MEM %08lx-%08lx",
+				(unsigned long)dev->resource[i].start,
+				(unsigned long)dev->resource[i].end);
+		else
+			printf("??? %08lx-%08lx",
+				(unsigned long)dev->resource[i].start,
+				(unsigned long)dev->resource[i].end);
+
+		printf("\n");
+	}
+}
+
+void
+pci_print_devices(void)
+{
+	pcidev_t *dev;
+
+	DrvDebug(_PCI,5,"pci_print_devices()\n");
+
+	if (pci_devices == 0) {
+		printf("PCI: no devices enumerated\n");
+		return;
+	}
+
+	printf("PCI: enumerated devices\n");
+	for (dev = pci_devices; dev != 0; dev = dev->next)
+		pci_print_one_device(dev);
+	printf("\n");
+}
+
 u32_t
 scan_bus(pcibus_t *bus)
 {
@@ -265,12 +358,14 @@ scan_bus(pcibus_t *bus)
 	pcibus_t	*child;
 	u32_t		l, iostart, iosize, buses;
 	u16_t		cmd, tmp, vid, did, ssvid, ssdid, cr;
-	u16_t		class;
+	u32_t		class;
 	u8_t		bn, max, hdr, mf, rev;
 	u8_t		master, irq, intpin;
 	u8_t		devfn;
 	int		i, slot, fn, num_bars, nfuncs;
 	resource_t	res[DEVICE_COUNT_RESOURCE];
+
+	DrvDebug(_PCI,5,"scan_bus()\n");
 
 	max = bus->secondary;
 	bn  = bus->number;
@@ -311,7 +406,7 @@ scan_bus(pcibus_t *bus)
 			if (did == 0xffff)
 				continue;
 
-			/* Re-read header type for each function — it can
+			/* Re-read header type for each function it can
 			 * differ across functions of the same device. */
 			if (fn > 0) {
 				hdr = 0;
@@ -324,16 +419,20 @@ scan_bus(pcibus_t *bus)
 			num_bars = get_num_bars(hdr);
 
 			/* Subsystem vendor is at 0x2c, subsystem ID at 0x2e.
-			 * Read into correctly named variables. */
-			prcw(bn, devfn, PCI_SUBSYSTEM_VENDOR_ID, &ssvid);
-			prcw(bn, devfn, PCI_SUBSYSTEM_ID,        &ssdid);
+			 * These registers are only valid for header type 0. */
+			ssvid = 0;
+			ssdid = 0;
+			if ((hdr & 0x7f) == 0) {
+				prcw(bn, devfn, PCI_SUBSYSTEM_VENDOR_ID, &ssvid);
+				prcw(bn, devfn, PCI_SUBSYSTEM_ID,        &ssdid);
+			}
 
 			/* Class (24 bits) and revision (8 bits) share one
 			 * DWORD at offset 0x08. */
 			l   = 0;
 			prcd(bn, devfn, PCI_CLASS_REVISION, &l);
 			rev   = (u8_t)(l & 0xff);
-			class = (u16_t)((l >> 16) & 0xffff);
+			class = (l >> 8) & 0x00ffffffU;
 
 			/* BAR probing: write all-ones, read back to determine
 			 * size, then restore original value. */
@@ -341,15 +440,34 @@ scan_bus(pcibus_t *bus)
 			for (i = 0; i < num_bars; i++)
 			{
 				u32_t bar_reg = PCI_BASE_ADDRESS_0 + (i * 4);
+				u32_t size;
 
-				prcd(bn, devfn, bar_reg, &iostart);
-				pwcd(bn, devfn, bar_reg, 0xffffffff);
-				prcd(bn, devfn, bar_reg, &iosize);
-				pwcd(bn, devfn, bar_reg, iostart);
+				iosize = 0;
+				if (prcd(bn, devfn, bar_reg, &iostart) != 0)
+					continue;
+
+				if (iostart != 0 && iostart != 0xffffffff) {
+					if (pwcd(bn,devfn,bar_reg,0xffffffff) != 0) continue;
+					if (prcd(bn,devfn,bar_reg,&iosize) != 0) continue;
+					if (pwcd(bn,devfn,bar_reg,iostart) != 0) continue;
+				}
+
+				if (iostart == 0 || iostart == 0xffffffff) {
+					res[i].start = 0;
+					res[i].end   = 0;
+					res[i].flags = 0;
+					continue;
+				}
 
 				res[i].start = get_map_base(iostart);
-				res[i].end   = barsize(iosize);
-				res[i].flags = iostart & 0x0f;
+				if (iostart & PCI_BASE_ADDRESS_SPACE_IO) {
+					size = barsize(iosize & PCI_BASE_ADDRESS_IO_MASK);
+					res[i].flags = IORESOURCE_IO;
+				} else {
+					size = barsize(iosize & PCI_BASE_ADDRESS_MEM_MASK);
+					res[i].flags = IORESOURCE_MEM;
+				}
+				res[i].end = size ? (res[i].start + size - 1) : 0;
 			}
 
 			/* Non-destructively test whether device supports
@@ -363,16 +481,12 @@ scan_bus(pcibus_t *bus)
 				pwcw(bn, devfn, PCI_COMMAND, cmd);
 			}
 
-			/* Read IRQ line and interrupt pin.
-			 * Bug fixed: original read irq with both prcb and
-			 * prcw — the prcw wrote 2 bytes into a u8_t.
-			 * Bug fixed: original read PCI_CAP_PTR (0x34) with
-			 * a comment saying "read irq level" — wrong register,
-			 * result was unused. Removed. */
+			/* Read IRQ line and interrupt pin.*/
 			irq    = 0;
 			intpin = 0;
-			prcb(bn, devfn, PCI_INTERRUPT_LINE, &irq);
-			prcb(bn, devfn, PCI_INTERRUPT_PIN,  &intpin);
+			if (prcb(bn, devfn, PCI_INTERRUPT_LINE, &irq) != 0) continue;
+			if (prcb(bn, devfn, PCI_INTERRUPT_PIN,  &intpin) != 0) continue;
+			if (intpin > 4) intpin=0;
 
 			/* Allocate device and info structures.
 			 * Bug fixed: original allocated dev then immediately
@@ -386,9 +500,7 @@ scan_bus(pcibus_t *bus)
 
 			dev->info = pci_malloc(sizeof(pcidevinfo_t));
 			if (dev->info == 0) {
-				/* pci_malloc uses kmem_zalloc — no matching
-				 * free available here, but at least we don't
-				 * proceed with a half-initialised device. */
+				kmem_free(dev, sizeof(pcidev_t));
 				continue;
 			}
 
@@ -488,6 +600,8 @@ find_pcidev(u8_t bus,u8_t devfn)
 {
 	pcidev_t *dev;
 
+	DrvDebug(_PCI,5,"find_pcidev()\n");
+
 	/*** For each pci_devices */
 	for(dev=pci_devices; dev; dev=dev->next)
 	{
@@ -511,7 +625,10 @@ pci_register_driver(struct pci_driver *drv)
 	pcidevid_t *id;
 	int	count=0;
 
-	PCIDEBUG("ENTER pci_register_driver(%s)\n",drv->name);
+	DrvDebug(_PCI,5,"pci_register_driver(%s)\n",drv ? drv->name : "??");
+
+	if (!drv || !drv->id_table)
+		return -EINVAL;
 
 	/*** For each pci_devices */
 	for(dev=pci_devices; dev; dev=dev->next)
@@ -524,18 +641,21 @@ pci_register_driver(struct pci_driver *drv)
 
 		for(id=drv->id_table; id->vendor; id++)
 		{
-			if (pci_match_one_device(dev,id) != 0)
-			{
-				dev->info->name=drv->name;
+			if (pci_match_one_device(dev,id) != 0) {
+				int ret=0;
+
 				if (drv->probe)
-					(*drv->probe)(dev,id);
-				count++;
-				break;
+					ret = (*drv->probe)(dev,id);
+
+				if (ret == 0) {
+					dev->info->name=drv->name;
+					count++;
+					break;
+				}
 			}
 		}
 	}
-	PCIDEBUG("EXIT pci_register_driver(%s)\n",drv->name);
-	return (count>0) ? 0 : -1;
+	return count;
 }
 
 uint_t	pcibios_max_latency = 255;
@@ -549,21 +669,31 @@ pci_is_enabled(pcidev_t *dev)
 void
 pci_set_master(pcidev_t *dev)
 {
+	u16_t	cmd;
 	u8_t	lat=0;
+
+	DrvDebug(_PCI,5,"pci_set_master()\n");
 
 	if (dev == 0)
 		return;
 
-	prcb(dev->bn,dev->devfn,PCI_LATENCY_TIMER,&lat);
-	if (lat < 16)
-		lat = (64 <= pcibios_max_latency) ? 64 : pcibios_max_latency;
-	else
-	if (lat > pcibios_max_latency)
-		lat = pcibios_max_latency;
-	else
+	if (prcw(dev->bn, dev->devfn, PCI_COMMAND, &cmd) != 0)
 		return;
 
-	pwcb(dev->bn,dev->devfn,PCI_LATENCY_TIMER,lat);
+	if (!(cmd & PCI_COMMAND_MASTER)) {
+		cmd |= PCI_COMMAND_MASTER;
+		if (pwcw(dev->bn, dev->devfn, PCI_COMMAND, cmd) != 0)
+			return;
+	}
+
+	dev->is_busmaster = 1;
+
+	if (prcb(dev->bn,dev->devfn,PCI_LATENCY_TIMER,&lat) == 0) {
+		if (lat < 16) {
+			lat=64;	
+			pwcb(dev->bn,dev->devfn,PCI_LATENCY_TIMER,lat);
+		}
+	}
 	return;
 }
 
@@ -589,6 +719,8 @@ pci_enable_bridge(pcidev_t *dev)
 {
 	pcidev_t *bridge;
 	int	retval;
+
+	DrvDebug(_PCI,5,"pci_enable_bridge()\n");
 
 	bridge=pci_upstream_bridge(dev);
 	if (bridge)
@@ -623,12 +755,84 @@ pci_is_bridge(pcidev_t *dev)
 int
 do_pci_device_enable(pcidev_t *dev,int bars)
 {
+	u16_t	cmd, newcmd;
+	int	i;
+
+	DrvDebug(_PCI,5,"do_pci_device_enable()\n");
+
+	if (dev == 0)
+		return -EINVAL;
+
+	if (prcw(dev->bn, dev->devfn, PCI_COMMAND, &cmd) != 0)
+		return -EIO;
+
+	newcmd = cmd;
+
+	for (i = 0; i < PCI_ROM_RESOURCE; i++) {
+		if (!(bars & (1 << i)))
+			continue;
+		if (dev->resource[i].flags & IORESOURCE_IO)
+			newcmd |= PCI_COMMAND_IO;
+		if (dev->resource[i].flags & IORESOURCE_MEM)
+			newcmd |= PCI_COMMAND_MEMORY;
+	}
+	for (i = PCI_BRIDGE_RESOURCES; i < DEVICE_COUNT_RESOURCE; i++) {
+		if (!(bars & (1 << i)))
+			continue;
+		if (dev->resource[i].flags & IORESOURCE_IO)
+			newcmd |= PCI_COMMAND_IO;
+		if (dev->resource[i].flags & IORESOURCE_MEM)
+			newcmd |= PCI_COMMAND_MEMORY;
+	}
+
+	/* Preserve historical behaviour: if the device probed as bus-master
+	 * capable, enable mastering as part of device enable. */
+	if (dev->master)
+		newcmd |= PCI_COMMAND_MASTER;
+
+	if (newcmd == cmd) {
+		if (newcmd & PCI_COMMAND_MASTER)
+			dev->is_busmaster = 1;
+		return 0;
+	}
+
+	if (pwcw(dev->bn, dev->devfn, PCI_COMMAND, newcmd) != 0)
+		return -EIO;
+
+	if (newcmd & PCI_COMMAND_MASTER)
+		dev->is_busmaster = 1;
+
 	return 0;
 }
 
 int
 pci_device_disable(pcidev_t *dev)
 {
+	u16_t	cmd;
+
+	DrvDebug(_PCI,5,"pci_device_disable()\n");
+
+	if (dev == 0)
+		return -EINVAL;
+
+	if (dev->enable_cnt <= 0) {
+		dev->enable_cnt = 0;
+		return 0;
+	}
+
+	dev->enable_cnt--;
+	if (dev->enable_cnt > 0)
+		return 0;
+
+	if (prcw(dev->bn, dev->devfn, PCI_COMMAND, &cmd) != 0)
+		return -EIO;
+
+	cmd &= ~(PCI_COMMAND_IO | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+
+	if (pwcw(dev->bn, dev->devfn, PCI_COMMAND, cmd) != 0)
+		return -EIO;
+
+	dev->is_busmaster = 0;
 	return 0;
 }
 
@@ -636,17 +840,18 @@ int
 pci_device_enable_flags(pcidev_t *dev,u32_t flags)
 {
 	pcidev_t *bridge;
-	int	err;
-	int	i, bars=0;
+	int	err, i, bars=0;
+
+	DrvDebug(_PCI,5,"pci_device_enable_flags()\n");
 
 	if (dev->pm_cap) {
 		u16_t 	pmcsr;
 
-		prcw(dev->bus->number,
+		if (prcw(dev->bus->number,
 			      dev->devfn,
 			      dev->pm_cap+PCI_PM_CTRL,
-			      &pmcsr);
-		dev->current_state=(pmcsr&PCI_PM_CTRL_STATE_MASK);
+			      &pmcsr) == 0)
+			dev->current_state=(pmcsr&PCI_PM_CTRL_STATE_MASK);
 	}
 	if (dev->enable_cnt > 0) {
 		dev->enable_cnt++;
@@ -698,6 +903,8 @@ request_region(u32_t ioaddr, u32_t n,char *name)
 	int	i;
 	caddr_t	vaddr;
 
+	DrvDebug(_PCI,5,"request_region(%x,%x,%s)\n",ioaddr,n,name);
+
 	for(i=0; i<MAX_RR; i++) 
 		if (_RR[i].ioaddr == 0) break;
 	if (i==MAX_RR) {
@@ -720,6 +927,8 @@ release_region(u32_t ioaddr,u32_t n)
 {
 	int	i;
 	
+	DrvDebug(_PCI,5,"release_region(%x,%x)\n",ioaddr,n);
+
 	for(i=0; i<MAX_RR; i++) {
 		if (_RR[i].ioaddr == ioaddr) {
 			_RR[i].ioaddr = 0;
@@ -738,6 +947,8 @@ void
 pic_add_handler()
 {
 	int 	mask,intno, bit, slaves, level, pic;
+
+	DrvDebug(_PCI,9,"pic_add_handler()\n");
 
 	/*
 	 * if picinit() has not yet run skip the hw update
@@ -777,6 +988,15 @@ pic_add_handler()
 int I440FX_init();
 int I440FX_probe_pci(pcidev_t *, pcidevid_t *);
 int I440FX_route(int cmd,int,...);
+int PIIX4_init();
+int PIIX4_probe_pci(pcidev_t *, pcidevid_t *);
+int PIIX4_route(int,int,...);
+int PIIX3_init();
+int PIIX3_probe_pci(pcidev_t *, pcidevid_t *);
+int PIIX3_route(int,int,...);
+int VIA_init();
+int VIA_probe_pci(pcidev_t *, pcidevid_t *);
+int VIA_route(int,int,...);
 
 static pcidevid_t I440FX_pci_tbl[] = 
 {
@@ -793,6 +1013,13 @@ struct pci_driver I440FX_driver =
 	0
 };
 
+static pci_router_ops_t i440fx_router_ops =
+{
+	"I440FX",
+	I440FX_route,
+	0x60
+};
+
 int 
 I440FX_init()
 {
@@ -801,8 +1028,10 @@ I440FX_init()
 	if (pci_devices == 0)
 		pciinit();
 
-	if (!pci_register_driver(&I440FX_driver))
+	if (pci_register_driver(&I440FX_driver))
 		I440FX_have_pci=1;
+	else
+		DrvDebug(_PCI,5,"I440FX_init(): Not Found\n");
 
 	return (I440FX_have_pci) ? 0 : -ENODEV;
 }
@@ -812,7 +1041,7 @@ I440FX_probe_pci(pcidev_t *pdev, pcidevid_t *ent)
 {
 	int	err=0, i, pin;
 
-	printf("I440FX_probe_pci(%02d:%02d.%d)\n",
+	DrvDebug(_PCI,5,"I440FX_probe_pci(%02d:%02d.%d)\n",
 		pdev->bn,PCI_SLOT(pdev->devfn),PCI_FUNC(pdev->devfn));
 
 	err=pci_device_enable(pdev);
@@ -821,7 +1050,7 @@ I440FX_probe_pci(pcidev_t *pdev, pcidevid_t *ent)
 		return err;
 	}
 	pci_set_master(pdev);
-	PirRoute=&I440FX_route;
+		pci_router=&i440fx_router_ops;
 
 	prcw(pdev->bn,pdev->devfn,PCI_VENDOR_ID,&i440.f0.vid);
 	prcw(pdev->bn,pdev->devfn,PCI_DEVICE_ID,&i440.f0.did);
@@ -851,7 +1080,7 @@ I440FX_probe_pci(pcidev_t *pdev, pcidevid_t *ent)
 	prcb(pdev->bn,pdev->devfn,0x91,&i440.f0.errsts);
 	prcb(pdev->bn,pdev->devfn,0x93,&i440.f0.trc);
 	for(pin=0;pin<DEVPCI_LEGACY_IRQ_PINS;pin++) 
-		i440.f0.pirqrc[pin]=PirRoute(PIRQ_GET,pin+1);
+				i440.f0.pirqrc[pin]=pci_router->route(PIRQ_GET,pin+1);
 #if 0
 	printf("\nVID=[%x] DID=[%x] COMMAND=[%x] STATUS=[%x] HDR=[%x]\n",
 			i440.f0.vid,i440.f0.did,i440.f0.pcicmd,
@@ -878,19 +1107,26 @@ I440FX_probe_pci(pcidev_t *pdev, pcidevid_t *ent)
 }
 
 int 
-I440FX_route(int cmd,int pin,...)
+I440FX_route(int cmd,int pirq,...)
 {
-	pin--;
-	/*printf("I440FX_route(%d,%d,%d)\n",cmd,pin,i);*/
-	switch(cmd) {
-	}
-	return 0;
-}
+	va_list	ap;
+	u8_t	irq=0;
 
-/* THIS WORKS FOR IRQ's */
-int PIIX4_init();
-int PIIX4_probe_pci(pcidev_t *, pcidevid_t *);
-int PIIX4_route(int,int,...);
+	pirq--;
+	switch(cmd) {
+	case PIRQ_GET:
+		DrvDebug(_PCI,5,"I440FX_route(GET, PIRQ%c) -> %d\n",
+			'A'+pirq-1,irq);
+		return irq;
+	case PIRQ_SET:
+		DrvDebug(_PCI,5,"I440FX_route(SET, PIRQ%c -> IRQ %d)\n",
+			'A'+pirq-1,irq);
+		return 0;
+	default:
+		printf("I440FX: Unknown cmd\n");
+	}
+	return -ENODEV;
+}
 
 static pcidevid_t PIIX4_pci_tbl[] = 
 {
@@ -907,6 +1143,14 @@ struct pci_driver PIIX4_driver =
 	0,
 };
 
+static pci_router_ops_t piix4_router_ops =
+{
+	"PIIX4",
+	PIIX4_route,
+	0x60
+};
+
+
 int 
 PIIX4_init()
 {
@@ -915,8 +1159,10 @@ PIIX4_init()
 	if (pci_devices == 0)
 		pciinit();
 
-	if (!pci_register_driver(&PIIX4_driver))
+	if (pci_register_driver(&PIIX4_driver))
 		PIIX4_have_pci=1;
+	else
+		DrvDebug(_PCI,5,"PIIX4_init(): Not Found\n");
 
 	return (PIIX4_have_pci) ? 0 : -ENODEV;
 }
@@ -926,8 +1172,8 @@ PIIX4_probe_pci(pcidev_t *pdev, pcidevid_t *ent)
 {
 	int	err=0, pin;
 
-	/* printf("PIIX4_probe_pci(%02d:%02d.%d)\n",
-		pdev->bn,PCI_SLOT(pdev->devfn),PCI_FUNC(pdev->devfn));*/
+	DrvDebug(_PCI,5,"PIIX4_probe_pci(%02d:%02d.%d)\n",
+		pdev->bn,PCI_SLOT(pdev->devfn),PCI_FUNC(pdev->devfn));
 
 	err=pci_device_enable(pdev);
 	if (err < 0) {
@@ -935,7 +1181,7 @@ PIIX4_probe_pci(pcidev_t *pdev, pcidevid_t *ent)
 		return err;
 	}
 	pci_set_master(pdev);
-	PirRoute=&PIIX4_route;
+		pci_router=&piix4_router_ops;
 
 	prcw(pdev->bn,pdev->devfn,PCI_VENDOR_ID,&piix4.f0.vid);
 	prcw(pdev->bn,pdev->devfn,PCI_DEVICE_ID,&piix4.f0.did);
@@ -955,7 +1201,7 @@ PIIX4_probe_pci(pcidev_t *pdev, pcidevid_t *ent)
 
 	/*** Pick up PIRQ settings ***/
 	for(pin=0;pin<DEVPCI_LEGACY_IRQ_PINS;pin++) 
-		piix4.f0.pirqrc[pin]=PirRoute(PIRQ_GET,pin+1);
+				piix4.f0.pirqrc[pin]=pci_router->route(PIRQ_GET,pin+1);
 
 	prcd(pdev->bn,pdev->devfn,0x64,&piix4.f0.devresc);
 	prcd(pdev->bn,pdev->devfn,0x50,&piix4.f0.devresd);
@@ -1003,36 +1249,33 @@ PIIX4_probe_pci(pcidev_t *pdev, pcidevid_t *ent)
 }
 
 int 
-PIIX4_route(int cmd,int pin,...)
+PIIX4_route(int cmd,int pirq,...)
 {
-	u8_t	x; 
-	int	i;
 	va_list	ap;
+	u8_t	irq; 
+	int	i;
 
-	pin--;
-	/* printf("PIIX4_route(%d,%d,%d)\n",cmd,pin,i);*/
 	switch(cmd) {
 	case PIRQ_GET:
-		prcb(Pbn,Pdevfn,0x60+pin,&x);
-		return (int)x;
+		prcb(Pbn,Pdevfn,pci_router->pirq_base+pirq-1,&irq);
+		DrvDebug(_PCI,5,"PIIX4_route(GET, PIRQ%c) -> %d\n",
+			'A'+pirq-1,irq);
+		return (int)irq;
 
 	case PIRQ_SET:
-		va_start(ap,pin);	
+		va_start(ap,pirq);	
 		i=va_arg(ap,int);	
 		va_end(ap);
-		x=(u8_t)i&0xff;
-		printf("Set PIRQ reg %x to 0x%02x\n",0x60+pin,x);
-		pwcb(Pbn,Pdevfn,0x60+pin,x);
+		irq=(u8_t)i&0xff;
+		pwcb(Pbn,Pdevfn,pci_router->pirq_base+pirq-1,irq);
+		DrvDebug(_PCI,5,"PIIX4_route(SET, PIRQ%c -> IRQ %d)\n",
+			'A'+pirq-1,irq);
 		return 0;
 	default:
 		printf("Unknown cmd %d\n",cmd);
 	}
 	return -1;
 }
-
-int PIIX3_init();
-int PIIX3_probe_pci(pcidev_t *, pcidevid_t *);
-int PIIX3_route(int,int,...);
 
 static pcidevid_t PIIX3_pci_tbl[] = 
 {
@@ -1049,6 +1292,13 @@ struct pci_driver PIIX3_driver =
 	0
 };
 
+static pci_router_ops_t piix3_router_ops =
+{
+	"PIIX3",
+	PIIX3_route,
+	0x60
+};
+
 int 
 PIIX3_init()
 {
@@ -1057,8 +1307,10 @@ PIIX3_init()
 	if (pci_devices == 0)
 		pciinit();
 
-	if (!pci_register_driver(&PIIX3_driver))
+	if (pci_register_driver(&PIIX3_driver))
 		PIIX3_have_pci=1;
+	else
+		DrvDebug(_PCI,5,"PIIX3_init(): Not Found\n");
 
 	return (PIIX3_have_pci) ? 0 : -ENODEV;
 }
@@ -1068,7 +1320,7 @@ PIIX3_probe_pci(pcidev_t *pdev, pcidevid_t *ent)
 {
 	int	err=0, pin, i;
 
-	printf("PIIX3_probe_pci(%02d:%02d.%d)\n",
+	DrvDebug(_PCI,5,"PIIX3_probe_pci(%02d:%02d.%d)\n",
 		pdev->bn,PCI_SLOT(pdev->devfn),PCI_FUNC(pdev->devfn));
 
 	err=pci_device_enable(pdev);
@@ -1076,7 +1328,7 @@ PIIX3_probe_pci(pcidev_t *pdev, pcidevid_t *ent)
 		printf("Failed to enable device\n");
 		return err;
 	}
-	PirRoute=&PIIX3_route;
+		pci_router=&piix3_router_ops;
 
 	prcw(pdev->bn,pdev->devfn,PCI_VENDOR_ID,&piix3.f0.vid);
 	prcw(pdev->bn,pdev->devfn,PCI_DEVICE_ID,&piix3.f0.did);
@@ -1090,7 +1342,7 @@ PIIX3_probe_pci(pcidev_t *pdev, pcidevid_t *ent)
 
 	/*** Pick up PIRQ settings ***/
 	for(pin=0;pin<DEVPCI_LEGACY_IRQ_PINS;pin++) 
-		piix3.f0.pirqrc[pin]=PirRoute(PIRQ_GET,pin+1);
+		piix3.f0.pirqrc[pin]=pci_router->route(PIRQ_GET,pin+1);
 
 	prcb(pdev->bn,pdev->devfn,0x69,&piix3.f0.tom);
 	prcw(pdev->bn,pdev->devfn,0x6b,&piix3.f0.mstat);
@@ -1135,18 +1387,32 @@ PIIX3_probe_pci(pcidev_t *pdev, pcidevid_t *ent)
 }
 
 int 
-PIIX3_route(int cmd,int pin,...)
+PIIX3_route(int cmd,int pirq,...)
 {
-	pin--;
-	/*printf("PIIX3_route(%d,%d,%d)\n",cmd,pin,i);*/
+	va_list	ap;
+	u8_t	irq=0;
+	int	i;
+
+	pirq--;
 	switch(cmd) {
+	case PIRQ_GET:
+		DrvDebug(_PCI,5,"PIIX3_route(GET, PIRQ%c) -> %d\n",
+			'A'+pirq-1,irq);
+		return irq;
+	case PIRQ_SET:
+		va_start(ap,pirq);	
+		i=va_arg(ap,int);	
+		va_end(ap);
+		irq=(u8_t)i&0xff;
+		/*pwcb(Pbn,Pdevfn,pci_router->pirq_base+pirq-1,irq);*/
+		DrvDebug(_PCI,5,"PIIX3_route(SET, PIRQ%c -> IRQ %d)\n",
+			'A'+pirq-1,irq);
+		return 0;
+	default:
+		printf("Unknown cmd %d\n",cmd);
 	}
 	return 0;
 }
-
-int VIA_init();
-int VIA_probe_pci(pcidev_t *, pcidevid_t *);
-int VIA_route(int,int,...);
 
 static pcidevid_t VIA_pci_tbl[] = 
 {
@@ -1163,18 +1429,26 @@ struct pci_driver VIA_driver =
 	0
 };
 
+static pci_router_ops_t via_router_ops =
+{
+	"VIA",
+	VIA_route,
+	0x55
+};
+
 int 
 VIA_init()
 {
 	int	VIA_have_pci=0;
 
 	if (pci_devices == 0) {
-		printf("call pciinit()\n");
 		pciinit();
 	}
 
-	if (!pci_register_driver(&VIA_driver))
+	if (pci_register_driver(&VIA_driver))
 		VIA_have_pci=1;
+	else
+		DrvDebug(_PCI,5,"VIA_init(): Not Found\n");
 
 	return (VIA_have_pci) ? 0 : -ENODEV;
 }
@@ -1184,7 +1458,7 @@ VIA_probe_pci(pcidev_t *pdev, pcidevid_t *ent)
 {
 	int	err=0, pin;
 
-	printf("VIA_probe_pci(%02d:%02d.%d)\n",
+	DrvDebug(_PCI,5,"VIA_probe_pci(%02d:%02d.%d)\n",
 		pdev->bn,PCI_SLOT(pdev->devfn),PCI_FUNC(pdev->devfn));
 
 	err=pci_device_enable(pdev);
@@ -1193,7 +1467,7 @@ VIA_probe_pci(pcidev_t *pdev, pcidevid_t *ent)
 		return err;
 	}
 	pci_set_master(pdev);
-	PirRoute=&VIA_route;
+		pci_router=&via_router_ops;
 
 	prcw(pdev->bn,pdev->devfn,PCI_VENDOR_ID,&via.f0.vid);
 	prcw(pdev->bn,pdev->devfn,PCI_DEVICE_ID,&via.f0.did);
@@ -1218,7 +1492,7 @@ VIA_probe_pci(pcidev_t *pdev, pcidevid_t *ent)
 
 	/*** Pick up PIRQ settings ***/
 	for(pin=0;pin<DEVPCI_LEGACY_IRQ_PINS;pin++) 
-		via.f0.pirqrc[pin]=PirRoute(PIRQ_GET,pin+1);
+		via.f0.pirqrc[pin]=pci_router->route(PIRQ_GET,pin+1);
 
 	{ 
 	u16_t irq1,irq2;
@@ -1271,33 +1545,35 @@ VIA_probe_pci(pcidev_t *pdev, pcidevid_t *ent)
 }
 
 int 
-VIA_route(int cmd,int pin,...)
+VIA_route(int cmd,int pirq,...)
 {
 	va_list	ap;
-	u8_t	x; 
-	int	i, r,s;
+	u8_t	x,irq=0; 
+	int	i, r, s;
 
-	pin--;
-	r=0x55+(pin>>1);
-	s=(pin&1)?4:0;
+	pirq--;
+	r=0x55+(pirq>>1);
+	s=(pirq&1)?4:0;
 	i=0;
 	switch(cmd) {
 	case PIRQ_GET:
+		DrvDebug(_PCI,5,"VIA_route(GET, PIRQ%c) -> %d\n",
+			'A'+pirq-1,irq);
 		prcb(Pbn,Pdevfn,r,&x);
 		x = (x >> s) & 0x0f;
-		printf("VIA_route(PIRQ_GET,INT#%c)=%d\n",IntPin(pin),x);
 		return (int)x;
 
 	case PIRQ_SET:
-		va_start(ap,pin);
+		va_start(ap,pirq);
 		i=va_arg(ap,int);
 		va_end(ap);	
-		printf("VIA_route(PIRQ_SET,INT#%c,%d)\n",IntPin(pin),i);
 
 		prcb(Pbn,Pdevfn,r,&x);
 		x &= ~(0x0f<<s);
 		x |= ((i&0x0f)<<s);
-		pwcb(Pbn,Pdevfn,r,&x);
+		pwcb(Pbn,Pdevfn,r,x);
+		DrvDebug(_PCI,5,"VIA_route(SET, PIRQ%c -> IRQ %d)\n",
+			'A'+pirq-1,irq);
 		return 0;
 	default:
 		printf("Unknown cmd %d\n",cmd);
@@ -1306,32 +1582,32 @@ VIA_route(int cmd,int pin,...)
 }
 
 int 
-PCI_route(int cmd,int pin,...)
+PCI_route(int cmd,int pirq,...)
 {
-	u8_t	x; 
+	u8_t	irq=0; 
 	va_list ap;
-	int	i;
-	int	r;
+	int	i, r;
 
-	printf("PCI_route()\n");
-	pin--;
-	r= 0x60 + pin; /*PIRQ = A=0x60, B=0x61, C=0x62, D=0x63 */
+	pirq--;
+	r = ((pci_router != 0) ? pci_router->pirq_base : 0x60) + pirq;
 
 	switch(cmd) {
 	case PIRQ_GET:
-		prcb(Pbn,Pdevfn,r,&x);
-		x &= 0x0f;
-		printf("PCI_route(PIRQ_GET,INT#%c)=%d\n",IntPin(pin),x);
-		return (int)x;
+		prcb(Pbn,Pdevfn,r,&irq);
+		irq &= 0x0f;
+		DrvDebug(_PCI,5,"PCI_route(GET, PIRQ%c) -> %d\n",
+			'A'+pirq-1,irq);
+		return (int)irq;
 
 	case PIRQ_SET:
-		va_start(ap,pin);
+		va_start(ap,pirq);
 		i=va_arg(ap,int);
 		va_end(ap);
-		printf("PCI_route(PIRQ_SET,INT#%c,%d)\n",IntPin(pin),i);
-		prcb(Pbn,Pdevfn,r,&x);
-		x = (u8_t)(i & 0x0f);
-		pwcb(Pbn,Pdevfn,r,x);
+		prcb(Pbn,Pdevfn,r,&irq);
+		irq = (u8_t)(i & 0x0f);
+		pwcb(Pbn,Pdevfn,r,irq);
+		DrvDebug(_PCI,5,"PCI_route(SET, PIRQ%c -> IRQ %d)\n",
+			'A'+pirq-1,irq);
 		return 0;
 	default:
 		printf("Unknown cmd %d\n",cmd);
@@ -1360,8 +1636,8 @@ PCI_get_interrupt(pcidev_t *pdev)
 {
 	int	pirq;
 
-/*	printf("PCI_get_interrupt(IRQ=%d, INT#%c)\n",pdev->irq,
-						     IntPin(pdev->intpin));*/
+	DrvDebug(_PCI,5,"PCI_get_interrupt(IRQ=%d, INT#%c)\n",pdev->irq,
+						     IntPin(pdev->intpin));
 
 	if (pdev->intpin == 0 || pdev->intpin > 4) {
 		printf("PCI device does not specify interrupt pin\n");
@@ -1370,7 +1646,7 @@ PCI_get_interrupt(pcidev_t *pdev)
 
 	pirq = ((int)((pdev->intpin-1) + PCI_SLOT(pdev->devfn)) % 4) ;
 
-	PCIDEBUG("devfn=%04x [%c,irq=%d] pirq=%d maps to IRQ%d\n", 
+	DrvDebug(_PCI,5,"devfn=%04x [%c,irq=%d] pirq=%d maps to IRQ%d\n", 
 		pdev->devfn,
 		IntPin(pdev->intpin),
 		pdev->irq,
@@ -1403,7 +1679,7 @@ show_irqroute()
 	{
 		u8_t irq;
 
-		irq=PirRoute(PIRQ_GET,pin+1);
+		irq=pci_router->route(PIRQ_GET,pin+1);
 		if (irq & 0x80)
 			printf("PIRQ%c disabled\n",IntPin(pin+1));
 		else
@@ -1481,11 +1757,11 @@ elcr_probe()
 {
 	elcr_status=inb(ELCR_PORT) | inb(ELCR_PORT+1) << 8;
 	if ((elcr_status & (ELCR_MASK(0) | ELCR_MASK(1) | ELCR_MASK(2) |
-			    ELCR_MASK(8) | ELCR_MASK(13))) != 0)
+			    ELCR_MASK(8) | ELCR_MASK(13))) != 0) {
+		DrvDebug(_PCI,5,"elcr_probe(): Not Found\n");
 		return ENXIO;
-
+	}
 	elcr_found=1;
-	/*elcr_show();*/
 	return 0;
 }
 
@@ -1522,7 +1798,8 @@ myset_elt(int irq, int mode)
 {
 	int i, port, bit;
 
-	printf("myset_elt(%d,%d)\n",irq,mode);
+	DrvDebug(_PCI,5,"myset_elt(%d,%d)\n",irq,mode);
+
 	switch (irq) {
 	case 0:
 	case 1:
@@ -1559,21 +1836,22 @@ myset_elt(int irq, int mode)
 /*
  * Dynamically register an interrupt handler
  *
- * RegisterIRQ(11, &ataintr, SPL6, INTR_TRIGGER_LEVEL);
+ * RegisterIRQ("ata",11, &ataintr, SPL6, INTR_TRIGGER_LEVEL);
  */
 int
-RegisterIRQ(int irq,int (*func)(),int pri,enum intr_trigger le)
+RegisterIRQ(char *name,int irq,int (*func)(),int pri,enum intr_trigger le)
 { 
 	extern int	intnull(), (*ivect[])(), nintr;
 	extern uchar_t	intpri[];
 	int	old_intr_mask;
+
+	DrvDebug(_PCI,5,"RegisterIRQ(%s,%08x,pri=%d)\n",name,func,pri);
 
 	if (ivect[irq] == intnull) {
 		ivect[irq]=func;
 		intpri[irq]=pri;
 		if ((int)(irq+1) > nintr)
 			nintr=irq+1;
-		/*picinit();*/
 		if (splvalid_flag) {
 			asm("cli");
 			pic_add_handler(); /*irq*/
@@ -1601,6 +1879,5 @@ RegisterIRQ(int irq,int (*func)(),int pri,enum intr_trigger le)
 	if (old_intr_mask != level_intr_mask)
 		elcr_write_trigger(irq, le); 
 
-	/*elcr_show();*/
 	return 0;
 }

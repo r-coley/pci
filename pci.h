@@ -1,7 +1,5 @@
 /*
  * pci.h
- *
- * PCI defines and function prototypes
  */
 #ifndef PCI_H
 #define PCI_H
@@ -30,18 +28,75 @@ typedef unsigned long ptrsize_t;
  *  1-0  = 0 (must be zero)
  */
 
-#include "plist.h"
+#define INLINE
 
-#define SVR4
-#if defined(SVR4) && defined(i386)
-#  ifndef SI86IOPL
-#  define SET_IOPL()   sysi86(SI86V86, V86SC_IOPL, PS_IOPL)
-#  define RESET_IOPL() sysi86(SI86V86, V86SC_IOPL, 0)
-#  else
-#  define SET_IOPL()   sysi86(SI86IOPL, 3)
-#  define RESET_IOPL() sysi86(SI86IOPL, 0)
-#  endif
-#endif
+typedef struct list_head {
+	struct list_head *next, *prev;
+} List_t;
+
+#define LIST_HEAD_INIT(name) { &(name), &(name) }
+
+#define LIST_HEAD(X) List_t X = LIST_HEAD_INIT(X)
+
+#define INIT_LIST_HEAD(ptr) \
+	do { (ptr)->next = (ptr); (ptr)->prev = (ptr); } while(0)
+
+#define list_entry(Ptr,Type,Elem) \
+	((Type *)((char *)(Ptr) - offsetof(Type,Elem)))
+
+#define list_for_each(pos,head) \
+	for(pos=(List_t *)(head)->next; pos != (head); pos=pos->next)	
+
+static INLINE void __list_add(List_t *new,List_t *prev,List_t *next)
+{
+	next->prev=new;
+	new->next = next;
+	new->prev = prev;
+	prev->next = new;
+}
+
+static INLINE void list_add(List_t *new,List_t *head)
+{
+	__list_add(new,head,head->next);
+}
+
+static INLINE void list_add_tail(List_t *new, List_t *head)
+{
+	__list_add(new, head->prev, head);
+}
+
+static INLINE void __list_del(List_t *prev,List_t *next)
+{
+	next->prev=prev;
+	prev->next=next;
+}
+
+static INLINE void
+list_del(List_t *entry)
+{
+	__list_del(entry->prev, entry->next);
+}
+
+static INLINE int list_empty(List_t *head)
+{
+	return head->next == head;
+}
+
+static INLINE void list_splice(List_t *list, List_t *head)
+{
+	List_t *first=list->next;
+
+	if (first != list) {
+		List_t *last = list->prev;
+		List_t *at = head->next;
+
+		first->prev = head;
+		head->next = first;
+
+		last->next = at;
+		at->prev = last;
+	}
+}
 
 #define powerof2(x)	((((x)-1) & (x)) == 0)
 
@@ -74,11 +129,7 @@ typedef unsigned long ptrsize_t;
 #define CFG_DATA	0x0cfc
 #define PCI_EN		0x80000000U
 
-/*
- * ALIGN: produces a mask, not an address name is misleading but kept for
- * source compatibility. 
- */
-#define ALIGN(x)	(~(sizeof(x) - 1))
+#define ALIGN_MASK(x)	(~((x) - 1))
 
 #define PCI_ADDR(B, DF) \
 	((u32_t)(PCI_EN                          \
@@ -92,15 +143,13 @@ enum {
 
 #define _VD(vend, dev)    (u16_t)(vend), (u16_t)(dev)
 #define _SS(sv, sd)       (u16_t)(sv),   (u16_t)(sd)
-#define _CM(class, mask)  (u16_t)(class), (u16_t)(mask)
+#define _CM(class, mask)  (u32_t)(class), (u32_t)(mask)
 
 #define PCI_DEVICE(vendor, dev) \
 		_VD(vendor, dev),              \
 		_SS(PCI_ANY_ID, PCI_ANY_ID),   \
 		_CM(0, 0),                     \
 		0
-
-#define PCIDEBUG	if (pci_debug) printf
 
 #define BAR_ISIO(x)	(((x) & 0x01) == 1)
 #define IOMASK		((u32_t)0xfffffffc)
@@ -110,8 +159,6 @@ enum {
 #define pci_resource_start(dev, bar)	((dev)->resource[(bar)].start)
 #define pci_resource_end(dev, bar)	((dev)->resource[(bar)].end)
 #define pci_resource_flags(dev, bar)	((dev)->resource[(bar)].flags)
-
-#include "pci_ids.h"
 
 #define PCI_INVALID_IRQ		0xff
 #define PCI_FUNCMAX		7
@@ -276,6 +323,13 @@ enum {
 	PIRQ_SET
 };
 
+struct pci_router_ops {
+	char	*name;
+	int	(*route)(int, int, ...);
+	u8_t	pirq_base;
+};
+typedef struct pci_router_ops pci_router_ops_t;
+
 struct resource {
 	char		*name;
 	u32_t		start;
@@ -355,8 +409,8 @@ struct pci_device_id {
 	u16_t	device;
 	u16_t	subvendor;
 	u16_t	subdevice;
-	u16_t	class;
-	u16_t	class_mask;
+	u32_t	class;
+	u32_t	class_mask;
 	void	*driver_data;
 };
 typedef struct pci_device_id pcidevid_t;
@@ -369,11 +423,6 @@ struct pci_driver {
 	int		*driver;
 };
 
-extern pcibus_t	  pci_root;	 /* root bus */
-extern pcidev_t	 *pci_devices;	 /* list of all devices */
-extern int	  pci_debug;
-
-
 /*
  * Chipset register shadow structures.
  * These are software copies of selected PCI config registers, filled in
@@ -381,7 +430,6 @@ extern int	  pci_debug;
  * address space do not use #pragma pack or rely on field offsets.
  * The offset comments show where each field lives in PCI config space.
  */
-
 typedef struct {
 	struct {
 		u16_t	vid;		/* 0x00 */
@@ -503,9 +551,14 @@ typedef struct {
 	} f0;
 } via_t;
 
+#define ELCR_PORT	0x4d0
+#define ELCR_MASK(irq)	(1 << (irq))
+
+#if 0
 /* ELCR (Edge/Level Control Register) ports */
 #define ELCR1	0x4d0		/* IRQs 0-7  */
 #define ELCR2	0x4d1		/* IRQs 8-15 */
+#endif
 #define XBCS	0x04e
 
 /*
@@ -556,12 +609,82 @@ typedef struct {
 	int	pin;
 } pci_link_lookup_t;
 
-#include "pci_bios.h"
+#pragma pack(1)
+typedef struct PIR_header {
+	u8_t	ph_signature[4];
+	u16_t	ph_version;	
+	u16_t	ph_length;	
+	u8_t	ph_router_bus;
+	u8_t	ph_router_dev_fn;
+	u16_t	ph_pci_irqs;
+	u16_t	ph_router_vendor;
+	u16_t	ph_router_device;
+	u32_t	ph_miniport;
+	u8_t	ph_res[11];
+	u8_t	ph_checksum;
+} PIR_header_t;
+
+#pragma pack(1)
+typedef struct PIR_intpin {
+	u8_t	link;
+	u16_t	irqs;
+} PIR_intpin_t;
+
+#pragma pack(1)
+typedef struct PIR_entry {
+	u8_t	pe_bus;
+	u8_t	pe_devfn;
+	struct	PIR_intpin	pe_intpin[4];
+	u8_t	pe_slot;
+	u8_t	pe_res3;
+} PIR_entry_t;
+
+#pragma pack(1)
+typedef struct PIR_table {
+	PIR_header_t pt_header;
+	PIR_entry_t  pt_entry[1];
+} PIR_table_t;
 
 typedef void pir_entry_handler(PIR_entry_t *,PIR_intpin_t *, void *);
-#include "pci_funcs.h"
 
-extern int pir_router_found;
-extern int verbose_bios;
+typedef struct {
+	u16_t	device_id;
+	char	*devicename;
+} pci_dev_t;
+
+typedef struct {
+	u8_t	subclass_id;
+	char	*subclass_name;
+} pci_subclass_t;
+
+typedef struct {
+	u8_t		class_id;
+	char		*class_name;
+	pci_subclass_t	subclass_list[16];
+} pci_class_t;
+
+#define MAX_DEV_PER_VENDOR	16
+
+typedef struct {
+	u16_t		vendor_id;
+	char		*vendorname;
+	pci_dev_t	device[MAX_DEV_PER_VENDOR];
+} pci_vendor_device_t;
+
+#define PIRQ_A	1
+#define PIRQ_B	2
+#define PIRQ_C	3
+#define PIRQ_D	4
+
+#define _PCI	pci_debug,0 	/*** Used for DrvDebug ***/
+
+extern int 	pci_debug;
+extern int level_intr_mask;
+extern pcibus_t	pci_root;	 /* root bus */
+extern pcidev_t	*pci_devices;	 /* list of all devices */
+extern int	pci_debug;
+extern int	pir_router_found;
+extern int	verbose_bios;
+extern pci_router_ops_t *pci_router;
 
 #endif /* PCI_H */
