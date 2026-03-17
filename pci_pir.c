@@ -108,10 +108,12 @@ pci_pir_parse(u32_t addr)
 	pci_route_count = nroutes;
 
 	pci_pir_walk_table(pci_pir_create_links,NULL);
-	printf("PCI: PIR table at %x, %d entries\n",addr,pci_route_count);
 
-	if (pci_debug>0)
+	if (pci_debug>0) {
+		printf("PCI: PIR table at %x, %d entries\n",
+			addr,pci_route_count);
 		pci_pir_dump_links(pt);
+	}
 }
 
 void
@@ -223,7 +225,7 @@ pci_pir_search_irq(u8_t bn, u8_t devfn, int pin)
 	    (vid == PCIV_INVALID)) return PCI_INVALID_IRQ;
 
 	if ((prcb(bn,devfn,PCI_INTERRUPT_PIN,&intpin) != 0) || 
-	    (intpin != pin+1)) return PCI_INVALID_IRQ;
+	    (intpin != PIR_TO_PCI_INTX(pin))) return PCI_INVALID_IRQ;
 
 	if ((prcb(bn,devfn,PCI_INTERRUPT_LINE,&intline) != 0) || 
 	    (intline == PCI_INVALID_IRQ)) return PCI_INVALID_IRQ;
@@ -325,7 +327,7 @@ pci_pir_route_interrupt(pcidev_t *pdev)
 
 	lookup.bn = pdev->bn;
 	lookup.devfn = pdev->devfn;
-	lookup.pin = pdev->intpin-1;
+	lookup.pin = PCI_INTX_TO_PIR(pdev->intpin);
 	lookup.pci_link_ptr = &pci_link;
 
 	pci_pir_walk_table(pci_pir_find_link_handler,&lookup);
@@ -338,9 +340,10 @@ pci_pir_route_interrupt(pcidev_t *pdev)
 		return NULL;
 	}
 
-	if (!PCI_INTERRUPT_VALID(pci_link->pl_irq)) {
+	irq = pci_link->pl_irq;
+	if (!PCI_INTERRUPT_VALID(irq)) {
 		if (pci_link->pl_irqmask != 0 && powerof2(pci_link->pl_irqmask))
-			irq=ffs(pci_link->pl_irqmask)-1;
+			irq=pci_ffs(pci_link->pl_irqmask)-1;
 		else
 			irq=pci_pir_choose_irq(pci_link,
 				pci_route_table->pt_header.ph_pci_irqs);
@@ -360,7 +363,7 @@ pci_pir_route_interrupt(pcidev_t *pdev)
 	if (!pci_link->pl_routed) {
 		error = pci_pir_biosroute(pdev->bn,
 					  pdev->devfn,
-					  lookup.pin, 
+					  PIR_TO_PCI_INTX(lookup.pin), 
 					  irq);
 		if (error != 0)
 			return NULL;
@@ -374,14 +377,14 @@ pci_pir_route_interrupt(pcidev_t *pdev)
 
 		pci_link->pl_routed = 1;
 	}
-#if 0 
-	printf("$PIR: %02d:%02d.%d INT#%c routed to irq %d\n",
-		pdev->bn,
-		PCI_SLOT(pdev->devfn),
-		PCI_FUNC(pdev->devfn),
-		IntPin(pdev->intpin), 
-		pci_link->pl_irq);
-#endif
+	if (pci_debug > 9) {
+		printf("$PIR: %02d:%02d.%d INT#%c routed to irq %d\n",
+			pdev->bn,
+			PCI_SLOT(pdev->devfn),
+			PCI_FUNC(pdev->devfn),
+			IntPin(pdev->intpin), 
+			pci_link->pl_irq);
+	}
 	return pci_link;
 }
 
@@ -441,5 +444,5 @@ pci_pir_biosroute(u8_t bus,u8_t devfn,int pin,int irq)
 		printf("$PIR: biosroute: router location unknown\n");
 		return ENXIO;
 	}
-	return pci_router->route(PIRQ_SET, pin+1, irq);
+	return pci_router->route(PIRQ_SET, pin, irq);
 }

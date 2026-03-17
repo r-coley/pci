@@ -8,6 +8,13 @@
 
 typedef unsigned long ptrsize_t;
 
+#define _PCI	pci_debug,0 	/*** Used for DrvDebug ***/
+
+#define PIRQ_A	1
+#define PIRQ_B	2
+#define PIRQ_C	3
+#define PIRQ_D	4
+
 /*
  * offsetof: use size_t cast, not int, so the value is unsigned and
  * wide enough on any target.  The (size_t)(&((Type *)0)->Elem) idiom
@@ -102,7 +109,7 @@ static INLINE void list_splice(List_t *list, List_t *head)
 
 /* Nibble accessors parenthesise argument to avoid operator-precedence bugs */
 #define LoNibble(X)	((X) & 0x0f)
-#define HiNibble(X)	(((X) & 0xf0) >> 4)
+#define HiNibble(X)	((int)((X) & 0xf0) >> 4)
 
 /*
  * WORD/DWORD: read unaligned little-endian values from a byte pointer.
@@ -122,6 +129,10 @@ static INLINE void list_splice(List_t *list, List_t *head)
 #define IORESOURCE_TYPE_BITS	0x00001f00
 #define IORESOURCE_IO		0x00000100
 #define IORESOURCE_MEM		0x00000200
+
+#define RES_NONE	0
+#define RES_MEM	1
+#define RES_IO	2
 
 #define DEVPCI_LEGACY_IRQ_PINS	4
 
@@ -163,6 +174,12 @@ enum {
 #define PCI_INVALID_IRQ		0xff
 #define PCI_FUNCMAX		7
 #define PCI_INTERRUPT_VALID(x)	((x) != PCI_INVALID_IRQ)
+
+/* PCI interrupt pin conversions */
+#define PCI_INTX_TO_PIR(pin)	((pin) - 1)	/* 1..4 -> 0..3 */
+#define PIR_TO_PCI_INTX(pin)	((pin) + 1)	/* 0..3 -> 1..4 */
+#define PCI_INTX_VALID(pin)	((pin) >= 1 && (pin) <= 4)
+#define PIR_PIN_VALID(pin)	((pin) >= 0 && (pin) <= 3)
 
 /*
  * PCI configuration space standard header (first 64 bytes).
@@ -307,15 +324,19 @@ enum {
  * driver actually manages.  PCI_BRIDGE_RESOURCES and PCI_NUM_RESOURCES are
  * kept for source compatibility but adjusted to fit.
  */
-#define PCI_BRIDGE_RESOURCES_NUM	4
+#define PCI_STD_RESOURCE_NUM	6
+#define PCI_BRIDGE_RESOURCE_NUM	3
 
 enum {
-	PCI_STD_RESOURCES    = 0,
-	PCI_STD_RESOURCES_END = 5,		/* BARs 0..5 */
-	PCI_ROM_RESOURCE     = 5,		/* reuse slot 5; ROM not a BAR */
-	PCI_BRIDGE_RESOURCES,
-	PCI_BRIDGE_RESOURCES_END=PCI_BRIDGE_RESOURCES+PCI_BRIDGE_RESOURCES_NUM-1,
-	DEVICE_COUNT_RESOURCE = 6		/* total slots in resource[] */
+	PCI_STD_RESOURCES     = 0,
+	PCI_STD_RESOURCES_END = PCI_STD_RESOURCE_NUM-1,
+	PCI_ROM_RESOURCE      = PCI_STD_RESOURCE_NUM,	
+
+	PCI_BRIDGE_RESOURCES = PCI_ROM_RESOURCE + 1,
+	PCI_BRIDGE_RESOURCES_END=
+		PCI_BRIDGE_RESOURCES+PCI_BRIDGE_RESOURCE_NUM-1,
+	DEVICE_COUNT_RESOURCE = 		/* total slots in resource[] */
+		PCI_BRIDGE_RESOURCES+PCI_BRIDGE_RESOURCE_NUM
 };
 
 enum {
@@ -323,10 +344,17 @@ enum {
 	PIRQ_SET
 };
 
+#define PCI_ROUTER_PRI_GENERIC	10
+#define PCI_ROUTER_PRI_440FX	20
+#define PCI_ROUTER_PRI_PIIX3	50
+#define PCI_ROUTER_PRI_PIIX4	60
+#define PCI_ROUTER_PRI_VIA		60
+
 struct pci_router_ops {
 	char	*name;
 	int	(*route)(int, int, ...);
 	u8_t	pirq_base;
+	int	priority;
 };
 typedef struct pci_router_ops pci_router_ops_t;
 
@@ -558,6 +586,15 @@ typedef struct {
 /* ELCR (Edge/Level Control Register) ports */
 #define ELCR1	0x4d0		/* IRQs 0-7  */
 #define ELCR2	0x4d1		/* IRQs 8-15 */
+
+
+int request_region(u32_t type, u32_t base, u32_t size, char *name);
+int release_region(u32_t type, u32_t base, u32_t size);
+int request_mem_region(u32_t base, u32_t size, char *name);
+int release_mem_region(u32_t base, u32_t size);
+int request_io_region(u32_t base, u32_t size, char *name);
+int release_io_region(u32_t base, u32_t size);
+
 #endif
 #define XBCS	0x04e
 
@@ -671,13 +708,7 @@ typedef struct {
 	pci_dev_t	device[MAX_DEV_PER_VENDOR];
 } pci_vendor_device_t;
 
-#define PIRQ_A	1
-#define PIRQ_B	2
-#define PIRQ_C	3
-#define PIRQ_D	4
-
-#define _PCI	pci_debug,0 	/*** Used for DrvDebug ***/
-
+/*** Externals ***/
 extern int 	pci_debug;
 extern int level_intr_mask;
 extern pcibus_t	pci_root;	 /* root bus */

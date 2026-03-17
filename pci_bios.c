@@ -33,13 +33,12 @@ char *
 Str(char *ptr, int n)
 {
 	static char buf[32];
-	int i;
 
 	if (n >= sizeof(buf))
 		n=sizeof(buf)-1;
 
 	memcpy(buf,ptr,n);
-	buf[i] = 0;
+	buf[n]=0;
 	return buf;
 }
 
@@ -351,7 +350,7 @@ bios_sigsearch(u32_t start, char *sig, int siglen, int paralen, int sigofs)
 	end = (u8_t *)BIOS_PADDRTOVADDR(BIOS_START + BIOS_SIZE);
 
 	/* Loop search */
-	while ((sp + sigofs + siglen) < end) {
+	while ((sp + sigofs + siglen) <= end) {
 		if (!bcmp(sp + sigofs, sig, siglen))
 			return (u32_t)BIOS_VADDRTOPADDR(sp);
 		sp += paralen;
@@ -394,8 +393,11 @@ scan_bios()
 
 	for (ptr = &bios_entries[0]; ptr->sig; ptr++) {
 		siglen = strlen(ptr->sig);
-		if (addr = bios_sigsearch(ptr->start, ptr->sig, siglen,
-		                          ptr->step, ptr->off)) {
+		addr = bios_sigsearch(ptr->start, 
+				      ptr->sig, siglen,
+		                      ptr->step, 
+				      ptr->off);
+		if (addr != 0) {
 			if (ptr->decode)
 				(*ptr->decode)((void *)BIOS_PADDRTOVADDR(addr));
 		}

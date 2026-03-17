@@ -9,6 +9,7 @@ int 	pci(int, u8_t, u8_t, u8_t, u32_t, int);
 
 /*** pci.c ***/
 pci_link_t *pci_pir_route_interrupt(pcidev_t *);
+pcidev_t *find_pcidev(u8_t,u8_t);
 int 	PCI_route(int,int,...);
 void 	show_irqroute(); 
 void	show_pirq();
@@ -17,7 +18,10 @@ void 	elcr_write_trigger(u32_t,enum intr_trigger);
 enum intr_trigger elcr_read_trigger(u32_t);
 int 	elcr_probe();
 void 	elcr_show();
-pcidev_t *find_pcidev(u8_t,u8_t);
+int	request_mem_region(u32_t, u32_t, char *name);
+int	release_mem_region(u32_t, u32_t);
+int	request_io_region(u32_t, u32_t, char *name);
+int	release_io_region(u32_t, u32_t);
 
 /*** pci_name.c ***/
 char 	*get_pci_vendor_name(u16_t);

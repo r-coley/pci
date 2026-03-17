@@ -16,8 +16,16 @@
 #include "pci_ids.h"
 #include "pci_funcs.h"
 
-#define ELCR_PORT	0x4d0
-#define ELCR_MASK(irq)	(1 << (irq))
+struct resource_region {
+	u32_t	base;
+	u32_t	size;
+	u32_t	type;
+	char	*name;	
+	caddr_t	addr;
+};
+
+#define MAX_RR	128
+struct resource_region _RR[MAX_RR];
 
 extern int pci_debug;
 extern int level_intr_mask;
@@ -32,8 +40,28 @@ static pci_router_ops_t pci_generic_router_ops =
 {
 	"PCI",
 	PCI_route,
-	0x60
+	0x60,
+	PCI_ROUTER_PRI_GENERIC
 };
+
+static void
+pci_set_router(pci_router_ops_t *router)
+{
+	if (router == 0)
+		return;
+
+	if (pci_router == 0 || router->priority > pci_router->priority) {
+		DrvDebug(_PCI,5,
+			"PCI router: %s selected (replacing %s)\n",
+			router->name,
+			pci_router ? pci_router->name : "(none)");
+		pci_router = router;
+	} else {
+		DrvDebug(_PCI,5,
+			"PCI router: keeping %s, ignoring %s\n",
+			pci_router->name, router->name);
+	}
+}
 
 i440fx_t	i440;
 piix3_t		piix3;
@@ -88,6 +116,8 @@ pciinit()
 
 	if (pci_devices != 0) return;
 
+	bzero(_RR,sizeof(_RR));
+
 	outl(CFG_ADDR,0);
 	tmp=inl(CFG_ADDR);
 	if (tmp != 0x00000000)
@@ -96,7 +126,7 @@ pciinit()
 		return;
 	}
 
-		pci_router=&pci_generic_router_ops;
+		pci_set_router(&pci_generic_router_ops);
 	scan_bios();
 
 	bzero(&pci_root, sizeof(pci_root));
@@ -106,15 +136,10 @@ pciinit()
 		printf("PCI: ELCR not found, level-triggered IRQs not available\n");
 
 	/* Register the chipset driver */
-	x=0;
-	if (x == 0)
-		x=I440FX_init();
-	if (x == 0)
-		x=PIIX3_init();
-	if (x == 0)
-		x=PIIX4_init();
-	if (x == 0)
-		x=VIA_init();
+	(void)I440FX_init();
+	(void)PIIX3_init();
+	(void)PIIX4_init();
+	(void)VIA_init();
 
 	/*show_pirq();
 	show_irqroute();*/
@@ -202,7 +227,7 @@ pci(int mode,u8_t bus,u8_t devfn,u8_t reg,u32_t value,int sz)
 }
 
 int
-ffs(int mask)
+pci_ffs(int mask)
 {
 	int 	bit;
 
@@ -434,30 +459,85 @@ scan_bus(pcibus_t *bus)
 			rev   = (u8_t)(l & 0xff);
 			class = (l >> 8) & 0x00ffffffU;
 
-			/* BAR probing: write all-ones, read back to determine
-			 * size, then restore original value. */
+			/* BAR probing: size each BAR with decode disabled and always
+			 * restore the original contents before leaving the probe path.
+			 * Also consume the upper dword of 64-bit memory BARs so later
+			 * BARs are not mis-parsed. */
 			bzero(res, sizeof(res));
 			for (i = 0; i < num_bars; i++)
 			{
 				u32_t bar_reg = PCI_BASE_ADDRESS_0 + (i * 4);
 				u32_t size;
+				u32_t orig_bar, probe_bar;
+				u32_t orig_bar_hi, probe_bar_hi;
+				u16_t probe_cmd, restore_cmd;
+				int wrote_probe, wrote_probe_hi, is64;
 
 				iosize = 0;
-				if (prcd(bn, devfn, bar_reg, &iostart) != 0)
+				orig_bar = 0;
+				probe_bar = 0;
+				orig_bar_hi = 0;
+				probe_bar_hi = 0;
+				probe_cmd = 0;
+				restore_cmd = 0;
+				wrote_probe = 0;
+				wrote_probe_hi = 0;
+				is64 = 0;
+				res[i].start = 0;
+				res[i].end   = 0;
+				res[i].flags = 0;
+
+				if (prcd(bn, devfn, bar_reg, &orig_bar) != 0)
 					continue;
 
-				if (iostart != 0 && iostart != 0xffffffff) {
-					if (pwcd(bn,devfn,bar_reg,0xffffffff) != 0) continue;
-					if (prcd(bn,devfn,bar_reg,&iosize) != 0) continue;
-					if (pwcd(bn,devfn,bar_reg,iostart) != 0) continue;
+				iostart = orig_bar;
+				if (iostart == 0 || iostart == 0xffffffff)
+					continue;
+
+				if (!(iostart & PCI_BASE_ADDRESS_SPACE_IO) &&
+				    ((iostart & PCI_BASE_ADDRESS_MEM_TYPE_MASK) ==
+				     PCI_BASE_ADDRESS_MEM_TYPE_64)) {
+					is64 = 1;
+					if ((i + 1) >= num_bars)
+						continue;
+					if (prcd(bn, devfn, bar_reg + 4, &orig_bar_hi) != 0)
+						continue;
+					if (orig_bar_hi != 0)
+						printf("PCI: %02x:%02x.%x BAR%d 64-bit base truncated to 32 bits\n",
+							bn, PCI_SLOT(devfn), PCI_FUNC(devfn), i);
+					res[i + 1].start = 0;
+					res[i + 1].end   = 0;
+					res[i + 1].flags = 0;
 				}
 
-				if (iostart == 0 || iostart == 0xffffffff) {
-					res[i].start = 0;
-					res[i].end   = 0;
-					res[i].flags = 0;
+				if (prcw(bn, devfn, PCI_COMMAND, &probe_cmd) != 0)
 					continue;
+				restore_cmd = probe_cmd;
+				probe_cmd &= ~(PCI_COMMAND_IO | PCI_COMMAND_MEMORY);
+				if (pwcw(bn, devfn, PCI_COMMAND, probe_cmd) != 0)
+					continue;
+
+				if (pwcd(bn, devfn, bar_reg, 0xffffffffU) == 0) {
+					wrote_probe = 1;
+					if (prcd(bn, devfn, bar_reg, &probe_bar) == 0)
+						iosize = probe_bar;
+					if (is64 && pwcd(bn, devfn, bar_reg + 4, 0xffffffffU) == 0) {
+						wrote_probe_hi = 1;
+						(void)prcd(bn, devfn, bar_reg + 4, &probe_bar_hi);
+					}
 				}
+
+				if (wrote_probe_hi)
+					(void)pwcd(bn, devfn, bar_reg + 4, orig_bar_hi);
+				if (wrote_probe)
+					(void)pwcd(bn, devfn, bar_reg, orig_bar);
+				(void)pwcw(bn, devfn, PCI_COMMAND, restore_cmd);
+
+				if (!wrote_probe || iosize == 0 || iosize == 0xffffffff)
+					continue;
+				if (is64 && probe_bar_hi != 0 && probe_bar_hi != 0xffffffff)
+					printf("PCI: %02x:%02x.%x BAR%d 64-bit size truncated to 32 bits\n",
+						bn, PCI_SLOT(devfn), PCI_FUNC(devfn), i);
 
 				res[i].start = get_map_base(iostart);
 				if (iostart & PCI_BASE_ADDRESS_SPACE_IO) {
@@ -468,6 +548,9 @@ scan_bus(pcibus_t *bus)
 					res[i].flags = IORESOURCE_MEM;
 				}
 				res[i].end = size ? (res[i].start + size - 1) : 0;
+
+				if (is64)
+					i++;
 			}
 
 			/* Non-destructively test whether device supports
@@ -549,32 +632,49 @@ scan_bus(pcibus_t *bus)
 				child->next  = bus->children;
 				bus->children = child;
 
-				/* Disable the bridge while we configure it. */
-				prcw(bn, devfn, PCI_COMMAND, &cr);
-				pwcw(bn, devfn, PCI_COMMAND, 0x0000);
-				pwcw(bn, devfn, PCI_STATUS,  0xffff);
+				/* Disable the bridge while we configure it and always
+				 * restore the original command register on exit. */
+				if (prcw(bn, devfn, PCI_COMMAND, &cr) == 0) {
+					u32_t orig_buses = 0;
+					int bridge_cfg_ok = 1;
 
-				/* Write primary, secondary, subordinate bus
-				 * numbers into the bridge's config space.
-				 * Preserve the top byte (secondary latency). */
-				prcd(bn, devfn, 0x18, &buses);
-				buses &= 0xff000000U;
-				buses |= ((u32_t)child->primary     <<  0)
-				       | ((u32_t)child->secondary   <<  8)
-				       | ((u32_t)child->subordinate << 16);
-				pwcd(bn, devfn, 0x18, buses);
+					if (pwcw(bn, devfn, PCI_COMMAND, 0x0000) != 0)
+						bridge_cfg_ok = 0;
+					if (bridge_cfg_ok && pwcw(bn, devfn, PCI_STATUS, 0xffff) != 0)
+						bridge_cfg_ok = 0;
+					if (bridge_cfg_ok && prcd(bn, devfn, 0x18, &orig_buses) != 0)
+						bridge_cfg_ok = 0;
 
-				/* Recurse — fills in child->subordinate. */
-				max = scan_bus(child);
+					buses = orig_buses;
+					if (bridge_cfg_ok) {
+						buses &= 0xff000000U;
+						buses |= ((u32_t)child->primary     <<  0)
+						       | ((u32_t)child->secondary   <<  8)
+						       | ((u32_t)child->subordinate << 16);
+						if (pwcd(bn, devfn, 0x18, buses) != 0)
+							bridge_cfg_ok = 0;
+					}
 
-				/* Write the real subordinate number back. */
-				child->subordinate = max;
-				buses = (buses & 0xff00ffffU)
-				      | ((u32_t)max << 16);
-				pwcd(bn, devfn, 0x18, buses);
+					if (bridge_cfg_ok) {
+						/* Recurse — fills in child->subordinate. */
+						max = scan_bus(child);
 
-				/* Re-enable the bridge. */
-				pwcw(bn, devfn, PCI_COMMAND, cr);
+						/* Write the real subordinate number back. */
+						child->subordinate = max;
+						buses = (buses & 0xff00ffffU)
+						      | ((u32_t)max << 16);
+						if (pwcd(bn, devfn, 0x18, buses) != 0) {
+							bridge_cfg_ok = 0;
+							(void)pwcd(bn, devfn, 0x18, orig_buses);
+						}
+					}
+
+					/* Re-enable the bridge. */
+					(void)pwcw(bn, devfn, PCI_COMMAND, cr);
+					if (!bridge_cfg_ok)
+						printf("PCI: %02x:%02x.%x bridge configuration incomplete\n",
+							bn, PCI_SLOT(devfn), PCI_FUNC(devfn));
+				}
 			}
 		}
 	}
@@ -888,57 +988,140 @@ pci_set_dma_mask(pcidev_t *dev,u32_t mask)
 	return 0;
 }
 
-struct resource_region {
-	u32_t	ioaddr;
-	u32_t	size;
-	char	*name;	
-	caddr_t	addr;
-};
-#define MAX_RR	64
-struct resource_region _RR[MAX_RR];
+static int
+rr_overlap(u32_t base1, u32_t size1, u32_t base2, u32_t size2)
+{
+	u32_t end1, end2;
+
+	if (size1 == 0 || size2 == 0)
+		return 0;
+
+	end1 = base1 + size1;
+	end2 = base2 + size2;
+
+	if (end1 <= base1 || end2 <= base2)
+		return 0;
+
+	return (base1 < end2 && end1 > base2);
+}
 
 int
-request_region(u32_t ioaddr, u32_t n,char *name)
+request_region(u32_t type, u32_t base, u32_t size, char *name)
 {
-	int	i;
-	caddr_t	vaddr;
+	int	i, free_slot;
+	caddr_t	addr;
+	u32_t	end;
 
-	DrvDebug(_PCI,5,"request_region(%x,%x,%s)\n",ioaddr,n,name);
+	DrvDebug(_PCI,5,"request_region(%d,%x,%x,%s)\n",
+		type, base, size, name ? name : "(null)");
 
-	for(i=0; i<MAX_RR; i++) 
-		if (_RR[i].ioaddr == 0) break;
-	if (i==MAX_RR) {
+	if (type != RES_MEM && type != RES_IO)
+		return 0;
+
+	if (size == 0)
+		return 0;
+
+	end = base + size;
+	if (end <= base)
+		return 0;
+
+	free_slot = -1;
+
+	for (i = 0; i < MAX_RR; i++) {
+		if (_RR[i].size == 0) {
+			if (free_slot < 0)
+				free_slot = i;
+			continue;
+		}
+
+		if (_RR[i].type != type)
+			continue;
+
+		if (rr_overlap(base, size, _RR[i].base, _RR[i].size)) {
+			DrvDebug(_PCI,5,
+			    "request_region: overlap [%x..%x) with [%x..%x) %s\n",
+			    base, base + size,
+			    _RR[i].base, _RR[i].base + _RR[i].size,
+			    _RR[i].name ? _RR[i].name : "(unnamed)");
+			return 0;
+		}
+	}
+
+	if (free_slot < 0) {
 		printf("MAX Resources RR reached for PCI\n");
 		return 0;
 	}
-	if (!(vaddr = (caddr_t)physmap(ioaddr,n,KM_NOSLEEP))) {
-		return 0;
+
+	addr = 0;
+	if (type == RES_MEM) {
+		addr = (caddr_t)physmap(base, size, KM_NOSLEEP);
+		if (addr == 0)
+			return 0;
 	}
 
-	_RR[i].ioaddr = ioaddr;
-	_RR[i].size = n;
-	_RR[i].name = name;
-	_RR[i].addr = vaddr;
+	_RR[free_slot].base = base;
+	_RR[free_slot].size = size;
+	_RR[free_slot].type = type;
+	_RR[free_slot].name = name;
+	_RR[free_slot].addr = addr;
+
 	return 1;
 }
 
 int
-release_region(u32_t ioaddr,u32_t n)
+release_region(u32_t type, u32_t base, u32_t size)
 {
 	int	i;
-	
-	DrvDebug(_PCI,5,"release_region(%x,%x)\n",ioaddr,n);
 
-	for(i=0; i<MAX_RR; i++) {
-		if (_RR[i].ioaddr == ioaddr) {
-			_RR[i].ioaddr = 0;
-			physmap_free(_RR[i].addr,_RR[i].size,KM_NOSLEEP);
+	DrvDebug(_PCI,5,"release_region(%d,%x,%x)\n", type, base, size);
+
+	for (i = 0; i < MAX_RR; i++) {
+		if (_RR[i].size == 0)
+			continue;
+
+		if (_RR[i].type != type)
+			continue;
+
+		if (_RR[i].base == base && _RR[i].size == size) {
+			if (type == RES_MEM && _RR[i].addr != 0)
+				physmap_free(_RR[i].addr, _RR[i].size, KM_NOSLEEP);
+
+			_RR[i].base = 0;
+			_RR[i].size = 0;
+			_RR[i].type = RES_NONE;
 			_RR[i].name = 0;
+			_RR[i].addr = 0;
 			return 1;
 		}
 	}
+
 	return 0;
 }
+
+int
+request_mem_region(u32_t base, u32_t size, char *name)
+{
+	return request_region(RES_MEM, base, size, name);
+}
+
+int
+release_mem_region(u32_t base, u32_t size)
+{
+	return release_region(RES_MEM, base, size);
+}
+
+int
+request_io_region(u32_t base, u32_t size, char *name)
+{
+	return request_region(RES_IO, base, size, name);
+}
+
+int
+release_io_region(u32_t base, u32_t size)
+{
+	return release_region(RES_IO, base, size);
+}
+
 /*
  * pic_add_handler() - update PIC masks after adding a new IRQ handler
  * must be called at spl7() with interrupts disabled
@@ -1017,7 +1200,8 @@ static pci_router_ops_t i440fx_router_ops =
 {
 	"I440FX",
 	I440FX_route,
-	0x60
+	0x60,
+	PCI_ROUTER_PRI_440FX
 };
 
 int 
@@ -1050,7 +1234,7 @@ I440FX_probe_pci(pcidev_t *pdev, pcidevid_t *ent)
 		return err;
 	}
 	pci_set_master(pdev);
-		pci_router=&i440fx_router_ops;
+	/*** pci_set_router(&i440fx_router_ops); ***/ /*NO*/
 
 	prcw(pdev->bn,pdev->devfn,PCI_VENDOR_ID,&i440.f0.vid);
 	prcw(pdev->bn,pdev->devfn,PCI_DEVICE_ID,&i440.f0.did);
@@ -1081,7 +1265,14 @@ I440FX_probe_pci(pcidev_t *pdev, pcidevid_t *ent)
 	prcb(pdev->bn,pdev->devfn,0x93,&i440.f0.trc);
 	for(pin=0;pin<DEVPCI_LEGACY_IRQ_PINS;pin++) 
 				i440.f0.pirqrc[pin]=pci_router->route(PIRQ_GET,pin+1);
-#if 0
+	if (pci_debug > 9) 
+		I440FX_dump(pdev, ent);
+	return 0;
+}
+
+int
+I440FX_dump(pcidev_t *pdev, pcidevid_t *ent)
+{
 	printf("\nVID=[%x] DID=[%x] COMMAND=[%x] STATUS=[%x] HDR=[%x]\n",
 			i440.f0.vid,i440.f0.did,i440.f0.pcicmd,
 			i440.f0.pcists,i440.f0.hdr);
@@ -1102,7 +1293,6 @@ I440FX_probe_pci(pcidev_t *pdev, pcidevid_t *ent)
 			i440.f0.fdhc,i440.f0.mtt,i440.f0.clt,i440.f0.smram);
 	printf("ERRCMD=[%x] ERRSTS=[%x] TRC=[%x]\n",
 				i440.f0.errcmd,i440.f0.errsts,i440.f0.trc);
-#endif
 	return 0;
 }
 
@@ -1112,19 +1302,8 @@ I440FX_route(int cmd,int pirq,...)
 	va_list	ap;
 	u8_t	irq=0;
 
-	pirq--;
-	switch(cmd) {
-	case PIRQ_GET:
-		DrvDebug(_PCI,5,"I440FX_route(GET, PIRQ%c) -> %d\n",
-			'A'+pirq-1,irq);
-		return irq;
-	case PIRQ_SET:
-		DrvDebug(_PCI,5,"I440FX_route(SET, PIRQ%c -> IRQ %d)\n",
-			'A'+pirq-1,irq);
-		return 0;
-	default:
-		printf("I440FX: Unknown cmd\n");
-	}
+	DrvDebug(_PCI,5,"I440FX_route(cmd=%d, pirq=%d): unsupported, routing handled by southbridge\n",
+			cmd,pirq);
 	return -ENODEV;
 }
 
@@ -1147,7 +1326,8 @@ static pci_router_ops_t piix4_router_ops =
 {
 	"PIIX4",
 	PIIX4_route,
-	0x60
+	0x60,
+	PCI_ROUTER_PRI_PIIX4
 };
 
 
@@ -1181,7 +1361,7 @@ PIIX4_probe_pci(pcidev_t *pdev, pcidevid_t *ent)
 		return err;
 	}
 	pci_set_master(pdev);
-		pci_router=&piix4_router_ops;
+		pci_set_router(&piix4_router_ops);
 
 	prcw(pdev->bn,pdev->devfn,PCI_VENDOR_ID,&piix4.f0.vid);
 	prcw(pdev->bn,pdev->devfn,PCI_DEVICE_ID,&piix4.f0.did);
@@ -1218,7 +1398,16 @@ PIIX4_probe_pci(pcidev_t *pdev, pcidevid_t *ent)
 	prcb(pdev->bn,pdev->devfn,0xd4,&piix4.f0.smbshdw1);
 	prcb(pdev->bn,pdev->devfn,0xd5,&piix4.f0.smbshdw2);
 	prcb(pdev->bn,pdev->devfn,0xd6,&piix4.f0.smbrev);
-#if 0
+	prcd(pdev->bn,pdev->devfn,0x60,&pci_remaps);
+
+	if (pci_debug>9)
+		PIIX4_debug(pdev, ent);
+	return 0;
+}
+
+int
+PIIX4_debug(pcidev_t *pdev, pcidevid_t *ent)
+{
 	printf("\nVID=[%x] DID=[%x] COMMAND=[%x] STATUS=[%x] HDR=[%x]\n",
 		piix4.f0.vid,piix4.f0.did,piix4.f0.pcicmd,
 		piix4.f0.pcists,piix4.f0.hdr);
@@ -1243,8 +1432,6 @@ PIIX4_probe_pci(pcidev_t *pdev, pcidevid_t *ent)
 	printf("PIRQRC0=[%x] PIRQRC1=[%x] PIRQRC2=[%x] PIRQRC3=[%x]\n",
 	      	piix4.f0.pirqrc[0],piix4.f0.pirqrc[1],
 		piix4.f0.pirqrc[2],piix4.f0.pirqrc[3]);
-#endif
-	prcd(pdev->bn,pdev->devfn,0x60,&pci_remaps);
 	return 0;
 }
 
@@ -1296,7 +1483,8 @@ static pci_router_ops_t piix3_router_ops =
 {
 	"PIIX3",
 	PIIX3_route,
-	0x60
+	0x60,
+	PCI_ROUTER_PRI_PIIX3
 };
 
 int 
@@ -1328,7 +1516,7 @@ PIIX3_probe_pci(pcidev_t *pdev, pcidevid_t *ent)
 		printf("Failed to enable device\n");
 		return err;
 	}
-		pci_router=&piix3_router_ops;
+		pci_set_router(&piix3_router_ops);
 
 	prcw(pdev->bn,pdev->devfn,PCI_VENDOR_ID,&piix3.f0.vid);
 	prcw(pdev->bn,pdev->devfn,PCI_DEVICE_ID,&piix3.f0.did);
@@ -1360,8 +1548,16 @@ PIIX3_probe_pci(pcidev_t *pdev, pcidevid_t *ent)
 	prcw(pdev->bn,pdev->devfn,0xaa,&piix3.f0.smireq);
 	prcb(pdev->bn,pdev->devfn,0xac,&piix3.f0.ctltmr);
 	prcb(pdev->bn,pdev->devfn,0xae,&piix3.f0.cthtmr);
+	prcd(pdev->bn,pdev->devfn,0x60,&pci_remaps);
 
-#if 0
+	if (pci_debug > 9)
+		PIIX3_debug(pdev, ent);
+	return 0;
+}
+
+int
+PIIX3_debug(pcidev_t *pdev, pcidevid_t *ent)
+{
 	printf("\nVID=[%x] DID=[%x] COMMAND=[%x] STATUS=[%x] HDR=[%x]\n",
 		piix3.f0.vid, piix3.f0.did, piix3.f0.pcicmd,
 		piix3.f0.pcists, piix3.f0.hdr);
@@ -1380,9 +1576,6 @@ PIIX3_probe_pci(pcidev_t *pdev, pcidevid_t *ent)
 	printf("FTMR=[%x] SMIREQ=[%x] CTLTMR=[%x] CTHTMR=[%x]\n",
 		piix3.f0.ftmr,piix3.f0.smireq,
 		piix3.f0.ctltmr,piix3.f0.cthtmr);
-#endif
-
-	prcd(pdev->bn,pdev->devfn,0x60,&pci_remaps);
 	return 0;
 }
 
@@ -1393,25 +1586,26 @@ PIIX3_route(int cmd,int pirq,...)
 	u8_t	irq=0;
 	int	i;
 
-	pirq--;
 	switch(cmd) {
 	case PIRQ_GET:
+		prcb(Pbn,Pdevfn,pci_router->pirq_base+pirq-1,&irq);
 		DrvDebug(_PCI,5,"PIIX3_route(GET, PIRQ%c) -> %d\n",
 			'A'+pirq-1,irq);
-		return irq;
+		return (int)irq;
+
 	case PIRQ_SET:
 		va_start(ap,pirq);	
 		i=va_arg(ap,int);	
 		va_end(ap);
 		irq=(u8_t)i&0xff;
-		/*pwcb(Pbn,Pdevfn,pci_router->pirq_base+pirq-1,irq);*/
+		pwcb(Pbn,Pdevfn,pci_router->pirq_base+pirq-1,irq);
 		DrvDebug(_PCI,5,"PIIX3_route(SET, PIRQ%c -> IRQ %d)\n",
 			'A'+pirq-1,irq);
 		return 0;
 	default:
 		printf("Unknown cmd %d\n",cmd);
 	}
-	return 0;
+	return -1;
 }
 
 static pcidevid_t VIA_pci_tbl[] = 
@@ -1433,7 +1627,8 @@ static pci_router_ops_t via_router_ops =
 {
 	"VIA",
 	VIA_route,
-	0x55
+	0x55,
+	PCI_ROUTER_PRI_VIA
 };
 
 int 
@@ -1457,6 +1652,7 @@ int
 VIA_probe_pci(pcidev_t *pdev, pcidevid_t *ent)
 {
 	int	err=0, pin;
+	u16_t irq1,irq2;
 
 	DrvDebug(_PCI,5,"VIA_probe_pci(%02d:%02d.%d)\n",
 		pdev->bn,PCI_SLOT(pdev->devfn),PCI_FUNC(pdev->devfn));
@@ -1467,7 +1663,7 @@ VIA_probe_pci(pcidev_t *pdev, pcidevid_t *ent)
 		return err;
 	}
 	pci_set_master(pdev);
-		pci_router=&via_router_ops;
+		pci_set_router(&via_router_ops);
 
 	prcw(pdev->bn,pdev->devfn,PCI_VENDOR_ID,&via.f0.vid);
 	prcw(pdev->bn,pdev->devfn,PCI_DEVICE_ID,&via.f0.did);
@@ -1494,14 +1690,22 @@ VIA_probe_pci(pcidev_t *pdev, pcidevid_t *ent)
 	for(pin=0;pin<DEVPCI_LEGACY_IRQ_PINS;pin++) 
 		via.f0.pirqrc[pin]=pci_router->route(PIRQ_GET,pin+1);
 
-	{ 
-	u16_t irq1,irq2;
 	prcw(Pbn,Pdevfn,0x44,&irq1);
 	prcw(Pbn,Pdevfn,0x46,&irq2);
-	printf("irq1=%x irq2=%x\n",irq1,irq2);
-	}
+	/*printf("irq1=%x irq2=%x\n",irq1,irq2);*/
+	prcd(pdev->bn,pdev->devfn,0x60,&pci_remaps);
 
-#if 0
+	if (pci_debug > 9)
+		VIA_dump(pdev, ent);
+
+	return 0;
+}
+
+int
+VIA_dump(pcidev_t *pdev, pcidevid_t *ent)
+{
+	int	i;
+
 	printf("%02x %s\n",
 		via.f0.revid,
 		via.f0.revid&0x0f==1?"VT82C686A":"VT82C686");
@@ -1538,9 +1742,6 @@ VIA_probe_pci(pcidev_t *pdev, pcidevid_t *ent)
 			printf("PIRQ%c Level\n",'A'+i);
 	}
 	printf("\n");
-#endif
-
-	prcd(pdev->bn,pdev->devfn,0x60,&pci_remaps);
 	return 0;
 }
 
@@ -1548,32 +1749,50 @@ int
 VIA_route(int cmd,int pirq,...)
 {
 	va_list	ap;
-	u8_t	x,irq=0; 
-	int	i, r, s;
+	u8_t	val, irq;
+	u8_t	reg;
+	int	i;
+	int	pirq_idx;
 
-	pirq--;
-	r=0x55+(pirq>>1);
-	s=(pirq&1)?4:0;
-	i=0;
+	if (pirq < 1 || pirq > 4) {
+		DrvDebug(_PCI,5,"VIA_route: invalid PIRQ %d\n",pirq);
+		return -1;
+	}
+
+	pirq_idx = pirq-1;
+	reg = 0x55 + (pirq_idx / 2);
+
 	switch(cmd) {
 	case PIRQ_GET:
-		DrvDebug(_PCI,5,"VIA_route(GET, PIRQ%c) -> %d\n",
-			'A'+pirq-1,irq);
-		prcb(Pbn,Pdevfn,r,&x);
-		x = (x >> s) & 0x0f;
-		return (int)x;
+		prcb(Pbn, Pdevfn, reg, &val);
+
+		if ((pirq_idx & 1) == 0)
+			irq = val & 0x0f;
+		else
+			irq = (val >> 4) & 0x0f;
+
+		DrvDebug(_PCI,5,"VIA_route(GET, PIRQ%c) -> IRQ %d (reg 0x%x= 0x%x)\n",
+			'A'+pirq_idx,irq,reg,val);
+		return (int)irq;
 
 	case PIRQ_SET:
 		va_start(ap,pirq);
 		i=va_arg(ap,int);
 		va_end(ap);	
 
-		prcb(Pbn,Pdevfn,r,&x);
-		x &= ~(0x0f<<s);
-		x |= ((i&0x0f)<<s);
-		pwcb(Pbn,Pdevfn,r,x);
-		DrvDebug(_PCI,5,"VIA_route(SET, PIRQ%c -> IRQ %d)\n",
-			'A'+pirq-1,irq);
+		irq = (u8_t)i & 0x0f;
+
+		prcb(Pbn, Pdevfn, reg, &val);
+
+		if ((pirq_idx & 1) == 0)
+			val = (val & 0xf0) | irq;
+		else
+			val = (val & 0x0f) | (irq << 4);
+	
+		pwcb(Pbn,Pdevfn, reg, val);
+
+		DrvDebug(_PCI,5,"VIA_route(SET, PIRQ%c -> IRQ %d) (reg 0x%x = 0x%x)\n",
+			'A' + pirq_idx,irq,reg,val);
 		return 0;
 	default:
 		printf("Unknown cmd %d\n",cmd);
@@ -1596,7 +1815,7 @@ PCI_route(int cmd,int pirq,...)
 		prcb(Pbn,Pdevfn,r,&irq);
 		irq &= 0x0f;
 		DrvDebug(_PCI,5,"PCI_route(GET, PIRQ%c) -> %d\n",
-			'A'+pirq-1,irq);
+			'A'+pirq,irq);
 		return (int)irq;
 
 	case PIRQ_SET:
@@ -1607,7 +1826,7 @@ PCI_route(int cmd,int pirq,...)
 		irq = (u8_t)(i & 0x0f);
 		pwcb(Pbn,Pdevfn,r,irq);
 		DrvDebug(_PCI,5,"PCI_route(SET, PIRQ%c -> IRQ %d)\n",
-			'A'+pirq-1,irq);
+			'A'+pirq,irq);
 		return 0;
 	default:
 		printf("Unknown cmd %d\n",cmd);
@@ -1644,7 +1863,7 @@ PCI_get_interrupt(pcidev_t *pdev)
 		return pdev->irq;
 	}	
 
-	pirq = ((int)((pdev->intpin-1) + PCI_SLOT(pdev->devfn)) % 4) ;
+	pirq = ((int)(PCI_INTX_TO_PIR(pdev->intpin) + PCI_SLOT(pdev->devfn)) % 4) ;
 
 	DrvDebug(_PCI,5,"devfn=%04x [%c,irq=%d] pirq=%d maps to IRQ%d\n", 
 		pdev->devfn,
@@ -1681,13 +1900,12 @@ show_irqroute()
 
 		irq=pci_router->route(PIRQ_GET,pin+1);
 		if (irq & 0x80)
-			printf("PIRQ%c disabled\n",IntPin(pin+1));
+			printf("PIRQ%c disabled\n",IntPin(PIR_TO_PCI_INTX(pin)));
 		else
-			printf("PIRQ%c -> IRQ%d\n",IntPin(pin+1), irq & 0xf);
+			printf("PIRQ%c -> IRQ%d\n",IntPin(PIR_TO_PCI_INTX(pin)), irq & 0xf);
 	}
 	printf("\n");
 
-#if 1
 	{
 		u8_t 	mbirq[2];
 		int	i;
@@ -1707,7 +1925,6 @@ show_irqroute()
 		}	
 	}
 	printf("\n");
-#endif
 }
 
 void
