@@ -1,7 +1,6 @@
 /*
  * pci_bios.c
  */
-#include <stdio.h>
 #include <sys/types.h>
 #include <sys/immu.h>
 
@@ -269,11 +268,9 @@ acpiCheckHeader(u32_t *ptr, char *sig)
 	int	 len = *(ptr + 1);
 	char	*cp  = (char *)ptr;
 
-	printf("Signature: %c%c%c%c\n", cp[0], cp[1], cp[2], cp[3]);
-	printf("Len: %d\n", len);
+	DrvDebug(_PCI,5,"acpiCheckHeader()\n");
 
 	if (bcmp(ptr, sig, 4) != 0) {
-		printf("Not [%s]\n", sig);
 		return -1;
 	}
 
@@ -281,7 +278,6 @@ acpiCheckHeader(u32_t *ptr, char *sig)
 	while (0 < len--)
 		check += *checkPtr++;
 
-	printf("check=%02x\n", check);
 	return (check == 0) ? 0 : -1;
 }
 
@@ -370,8 +366,6 @@ struct bios_entry bios_entries[] = {
     { "_SM3_",    SMBIOS3_START, SMBIOS3_STEP,  SMBIOS3_OFF, sm_bios   },
     { "_SM_",     SMBIOS_START,  SMBIOS_STEP,   SMBIOS_OFF,  sm_bios   },
     { "$PIR",     PIR_START,     PIR_STEP,      PIR_OFF,     pir_bios  },
-    { "_PIR",     PIR_START,     PIR_STEP,      PIR_OFF,     pir_bios  },
-    { "_PRT",     PIR_START,     PIR_STEP,      PIR_OFF,     pir_bios  },
     { "_32_",     BIOS32_START,  BIOS32_STEP,   BIOS32_OFF,  bios32    },
     { "$PnP",     PNP_START,     PNP_STEP,      PNP_OFF,     pnp_bios  },
     { "_DMI_",    DMI_START,     DMI_STEP,      DMI_OFF,     dmi_bios  },

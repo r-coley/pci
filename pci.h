@@ -6,14 +6,13 @@
 
 #include <sys/types.h>
 
+#ifndef NULL
+#define NULL            0
+#endif 
+
+#define NUM_ISA_INTERRUPTS	16
+
 typedef unsigned long ptrsize_t;
-
-#define _PCI	pci_debug,0 	/*** Used for DrvDebug ***/
-
-#define PIRQ_A	1
-#define PIRQ_B	2
-#define PIRQ_C	3
-#define PIRQ_D	4
 
 /*
  * offsetof: use size_t cast, not int, so the value is unsigned and
@@ -109,7 +108,7 @@ static INLINE void list_splice(List_t *list, List_t *head)
 
 /* Nibble accessors parenthesise argument to avoid operator-precedence bugs */
 #define LoNibble(X)	((X) & 0x0f)
-#define HiNibble(X)	((int)((X) & 0xf0) >> 4)
+#define HiNibble(X)	(u8_t)(((int)(X) & 0xf0) >> 4)
 
 /*
  * WORD/DWORD: read unaligned little-endian values from a byte pointer.
@@ -126,13 +125,14 @@ static INLINE void list_splice(List_t *list, List_t *head)
 
 #define QWORD(p)	(U64(DWORD(p), DWORD((u8_t *)(p) + 4)))
 
-#define IORESOURCE_TYPE_BITS	0x00001f00
-#define IORESOURCE_IO		0x00000100
-#define IORESOURCE_MEM		0x00000200
-
 #define RES_NONE	0
 #define RES_MEM	1
 #define RES_IO	2
+
+#define IORESOURCE_IO		0x00000100
+#define IORESOURCE_MEM		0x00000200
+#define IORESOURCE_PREFETCH	0x00002000
+#define IORESOURCE_MEM_64	0x00004000
 
 #define DEVPCI_LEGACY_IRQ_PINS	4
 
@@ -324,19 +324,15 @@ enum {
  * driver actually manages.  PCI_BRIDGE_RESOURCES and PCI_NUM_RESOURCES are
  * kept for source compatibility but adjusted to fit.
  */
-#define PCI_STD_RESOURCE_NUM	6
-#define PCI_BRIDGE_RESOURCE_NUM	3
+#define PCI_BRIDGE_RESOURCES_NUM	4
 
 enum {
-	PCI_STD_RESOURCES     = 0,
-	PCI_STD_RESOURCES_END = PCI_STD_RESOURCE_NUM-1,
-	PCI_ROM_RESOURCE      = PCI_STD_RESOURCE_NUM,	
-
-	PCI_BRIDGE_RESOURCES = PCI_ROM_RESOURCE + 1,
-	PCI_BRIDGE_RESOURCES_END=
-		PCI_BRIDGE_RESOURCES+PCI_BRIDGE_RESOURCE_NUM-1,
-	DEVICE_COUNT_RESOURCE = 		/* total slots in resource[] */
-		PCI_BRIDGE_RESOURCES+PCI_BRIDGE_RESOURCE_NUM
+	PCI_STD_RESOURCES    = 0,
+	PCI_STD_RESOURCES_END = 5,		/* BARs 0..5 */
+	PCI_ROM_RESOURCE     = 5,		/* reuse slot 5; ROM not a BAR */
+	PCI_BRIDGE_RESOURCES,
+	PCI_BRIDGE_RESOURCES_END=PCI_BRIDGE_RESOURCES+PCI_BRIDGE_RESOURCES_NUM-1,
+	DEVICE_COUNT_RESOURCE = 6		/* total slots in resource[] */
 };
 
 enum {
@@ -344,17 +340,10 @@ enum {
 	PIRQ_SET
 };
 
-#define PCI_ROUTER_PRI_GENERIC	10
-#define PCI_ROUTER_PRI_440FX	20
-#define PCI_ROUTER_PRI_PIIX3	50
-#define PCI_ROUTER_PRI_PIIX4	60
-#define PCI_ROUTER_PRI_VIA		60
-
 struct pci_router_ops {
 	char	*name;
 	int	(*route)(int, int, ...);
 	u8_t	pirq_base;
-	int	priority;
 };
 typedef struct pci_router_ops pci_router_ops_t;
 
@@ -376,9 +365,11 @@ struct pci_dev {
 	struct pci_bus	*bus;		/* bus this device is on */
 	struct pci_dev	*sibling;	/* next device on this bus */
 	struct pci_dev	*next;		/* chain of all devices */
+	struct pci_bus	*child_bus;	/* subordinate bus if this device is a bridge */
 
 	void		*sysdata;	/* hook for sys-specific data */
 	void		*dev;		/* hook for driver-specific data */
+	char		*name;		/* bound driver/device display name */
 	struct pci_dev_info *info;
 	int		(*route)(int, int, int);
 
@@ -586,15 +577,6 @@ typedef struct {
 /* ELCR (Edge/Level Control Register) ports */
 #define ELCR1	0x4d0		/* IRQs 0-7  */
 #define ELCR2	0x4d1		/* IRQs 8-15 */
-
-
-int request_region(u32_t type, u32_t base, u32_t size, char *name);
-int release_region(u32_t type, u32_t base, u32_t size);
-int request_mem_region(u32_t base, u32_t size, char *name);
-int release_mem_region(u32_t base, u32_t size);
-int request_io_region(u32_t base, u32_t size, char *name);
-int release_io_region(u32_t base, u32_t size);
-
 #endif
 #define XBCS	0x04e
 
@@ -684,6 +666,7 @@ typedef struct PIR_table {
 
 typedef void pir_entry_handler(PIR_entry_t *,PIR_intpin_t *, void *);
 
+#pragma pack()
 typedef struct {
 	u16_t	device_id;
 	char	*devicename;
@@ -708,14 +691,25 @@ typedef struct {
 	pci_dev_t	device[MAX_DEV_PER_VENDOR];
 } pci_vendor_device_t;
 
-/*** Externals ***/
+#define PIRQ_A	1
+#define PIRQ_B	2
+#define PIRQ_C	3
+#define PIRQ_D	4
+
+#define _PCI	pci_debug,0 	/*** Used for DrvDebug ***/
+
 extern int 	pci_debug;
 extern int level_intr_mask;
 extern pcibus_t	pci_root;	 /* root bus */
 extern pcidev_t	*pci_devices;	 /* list of all devices */
-extern int	pci_debug;
 extern int	pir_router_found;
 extern int	verbose_bios;
 extern pci_router_ops_t *pci_router;
+extern int	elcr_found;
+
+extern u8_t	pci_remaps[4];
+extern u8_t	Pbn, Pdevfn;
+extern pci_router_ops_t pci_generic_router_ops;
+extern PIR_table_t *pci_route_table;
 
 #endif /* PCI_H */

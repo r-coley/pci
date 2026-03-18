@@ -1,7 +1,6 @@
 /*
  * pci_name.c
  */
-#include <stdio.h>
 #include <sys/types.h>
 
 #include "pci.h"
@@ -222,86 +221,16 @@ static pci_class_t class_list[] =
 	}
 };
 
-static pci_vendor_device_t pvd[] =
-{
-	{ 0x1000, "NCR",
-	  {
-	    { 0x0001, "53c810" },
-	    { 0x0000, (char *)0 }
-	  }
-	},
-	{ 0x1002, "ATI",
-	  {
-	    { 0x4158, "Mach32" },
-	    { 0x0000, (char *)0 }
-	  }
-	},
-	{ 0x1004, "VLSI",
-	  {
-	    { 0x0005, "82c592-FC1" },
-	    { 0x0000, (char *)0 }
-	  }
-	},
-	{ 0x1005, "ADL",
-	  {
-	    { 0x0000, (char *)0 }
-	  }
-	},
-	{ 0x100b, "NS",
-	  {
-	    { 0x0000, (char *)0 }
-	  }
-	},
-	{ 0x100c, "Tseng Lab",
-	  {
-	    { 0x0000, (char *)0 }
-	  }
-	},
-	{ 0x1022, "AMD Corp",
-	  {
-	    { 0x2000, "79c970 [PCnet32 LANCE]" },
-	    { 0x2625, "PCnet/FAST III Am79C973" },
-	    { 0x0000, (char *)0 }
-	  }
-	},
-	{ 0x106b, "Apple Computer",
-	  {
-	    { 0x003f, "KeyLargo/Intrepid USB" },
-	    { 0x0000, (char *)0 }
-	  }
-	},
-	{ 0x8086, "Intel Corp",
-	  {
-	    { 0x1237, "440FX - 82441FX PMC [Natoma]" },
-	    { 0x2415, "82801AA AC'97 Audio Controller" },
-	    { 0x7000, "82371SB PIIX3 ISA [Natoma/Triton II]" },
-	    { 0x7111, "82371AB/EB/MB PIIX4 IDE" },
-	    { 0x7113, "82371AB/EB/MB PIIX4 ACPI" },
-	    { 0x0000, (char *)0 }
-	  }
-	},
-	{ 0x80ee, "VirtualBox",
-	  {
-	    { 0xbeef, "VirtualBox Graphics Adapter" },
-	    { 0xcafe, "VirtualBox Guest Service" },
-	    { 0x0000, (char *)0 }
-	  }
-	},
-	{ 0x0, (char *)0,
-	  {
-	    { 0x0000, (char *)0 }
-	  }
-	}
-};
+/*
+ * Device/vendor name lookup now comes from successful
+ * pci_register_driver() matches.  Keep only class/subclass
+ * naming in the PCI core.
+ */
 
 char *
 get_pci_vendor_name(u16_t vendor)
 {
-	int i;
-
-	for (i = 0; pvd[i].vendorname != (char *)0; i++)
-		if (pvd[i].vendor_id == vendor) break;
-	return pvd[i].vendorname;
+	return 0;
 }
 
 char *
@@ -355,19 +284,5 @@ get_pci_subclass_name(u8_t class, u8_t subclass)
 char *
 get_pci_dev(u16_t vendor, u16_t device)
 {
-	int	i, j, foundit = 0;
-
-	for (i = 0; pvd[i].vendorname != (char *)0; i++) {
-		if (pvd[i].vendor_id != vendor) continue;
-
-		for (j = 0; pvd[i].device[j].devicename != (char *)0; j++) {
-			if (pvd[i].device[j].device_id == device) {
-				foundit = 1;
-				break;
-			}
-		}
-		if (foundit == 1) return pvd[i].device[j].devicename;
-		break;
-	}
-	return "???";
+	return 0;
 }

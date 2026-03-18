@@ -12,8 +12,6 @@
 #include "pci_bios.h"
 #include "pci_funcs.h"
 
-#define NUM_ISA_INTERRUPTS	16
-
 /* IRQS: 3,4,5,6,7,9,10,11,12,14,15 */
 #define PCI_IRQ_OVERRIDE_MASK	0xdef8
 
@@ -30,7 +28,6 @@ pci_pir_dump_links(PIR_table_t *pt)
 {
 	List_t *p;
 	pci_link_t *pci_link;
-	char	*device_name;
 
 	printf("PCI Route Table\n");
 
@@ -40,11 +37,6 @@ pci_pir_dump_links(PIR_table_t *pt)
 		PCI_FUNC(pt->pt_header.ph_router_dev_fn),
 		pt->pt_header.ph_router_vendor,
 		pt->pt_header.ph_router_device);
-
-	device_name = get_pci_dev(pt->pt_header.ph_router_vendor,
-		pt->pt_header.ph_router_device);
-	if (device_name != 0)
-		printf("PCI: IRQ router: %s\n", device_name);
 
 	printf("Link  IRQ  Routed           Allowed IRQs\n");
 	list_for_each(p, &pci_links) 
@@ -72,6 +64,22 @@ pci_print_irqmask(u16_t code)
 		for(i=0;i<16;i++)
 			if (code & (1 << i))	
 				printf(" %d",i);
+	}
+}
+
+void
+pci_pir_init_weights(void)
+{
+	pcidev_t *dev;
+	int	i;
+
+	for(i=0; i<NUM_ISA_INTERRUPTS; i++)
+		pir_interrupt_weight[i]=0;
+
+	for(dev=pci_devices; dev != NULL; dev = dev->next) {
+		if (PCI_INTERRUPT_VALID(dev->irq) &&
+		   dev->irq < NUM_ISA_INTERRUPTS)
+			pir_interrupt_weight[dev->irq]++;
 	}
 }
 
@@ -385,6 +393,14 @@ pci_pir_route_interrupt(pcidev_t *pdev)
 			IntPin(pdev->intpin), 
 			pci_link->pl_irq);
 	}
+
+	/*
+	 * Weight counts devices using this IRQ; increment for each device
+	 * routed, not just the first
+	 */
+	if (irq < NUM_ISA_INTERRUPTS)
+		pir_interrupt_weight[irq]++;
+
 	return pci_link;
 }
 
@@ -394,19 +410,19 @@ pci_pir_route_interrupt(pcidev_t *pdev)
 int
 BUS_CONFIG_INTR(pcidev_t *pcidev,int irq,enum intr_trigger trig,enum intr_polarity pol)
 {
-	u32_t	vector;
-	extern int elcr_found;
 	extern	int	level_intr_mask;	/*KERNEL*/
 
 	DrvDebug(_PCI,5,"BUS_CONFIG_INTR()\n");
+
+	if (irq < 0 || irq >= NUM_ISA_INTERRUPTS) {
+		printf("PIC: IRQ %d out of range\n",irq);
+		return EINVAL;
+	}
 
 	if (trig == INTR_TRIGGER_CONFORM)
 		trig = INTR_TRIGGER_EDGE;
 	if (pol == INTR_POLARITY_CONFORM)
 		pol = INTR_POLARITY_HIGH;
-
-	vector=irq;
-	/* vector=atpic_vector(isrc);*/
 
 	if ((trig == INTR_TRIGGER_EDGE  && pol == INTR_POLARITY_LOW) ||
 	    (trig == INTR_TRIGGER_LEVEL && pol == INTR_POLARITY_HIGH)) {
@@ -414,7 +430,7 @@ BUS_CONFIG_INTR(pcidev_t *pcidev,int irq,enum intr_trigger trig,enum intr_polari
 		return EINVAL;
 	}
 
-	if ((vector == 0 || vector == 1 || vector == 2 || vector == 13) &&
+	if ((irq == 0 || irq == 1 || irq == 2 || irq == 13) &&
 	    trig == INTR_TRIGGER_LEVEL) {
 		printf("PIC: Ignoring invalid level/low config for IRQ\n");
 		return EINVAL;

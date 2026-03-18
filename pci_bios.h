@@ -86,7 +86,7 @@ struct smbios_structure_header {
 
 #define DMI_START	0x0
 #define DMI_SIG		"_DMI_"
-#define DMI_LEN		4
+#define DMI_LEN		5
 #define DMI_STEP	0x10
 #define DMI_OFF		0x0
 
